@@ -35,3 +35,8 @@
   remain unattributed. Separate container network namespaces are not fully covered.
 - Local installation uses `scripts/install.sh`, which refuses to replace an
   unrelated executable. Only explicitly requested `--demo` uses synthetic data.
+- The redesigned README shares the site's banner and explicit DEMO image.
+  `site/` contains the responsive project website, terminal recording and local
+  licensed fonts. Pages is configured as public with custom domain
+  `nettop.wutz.io`; the source repository remains private. The Pages workflow
+  deploys static files independently of Rust CI and its container dependencies.

@@ -48,3 +48,9 @@ loopback. It checks each transport/address family, both process directions,
 capture drops, interface rates and duplicate counting. UI and parser boundary
 behavior is also covered by Rust tests. Review evidence is local and excluded
 from the repository.
+
+The public project website is a dependency-free static site in `site/`, deployed
+by `.github/workflows/pages.yml` from `main`. Only `site/` is uploaded to Pages;
+the source repository remains private. `nettop.wutz.io` is a DNS-only Cloudflare
+CNAME to `itmitalles-de.github.io`. The site uses local fonts and explicit DEMO
+captures as intentional public product assets; local QA evidence stays outside Git.

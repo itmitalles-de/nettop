@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="nettop is a Linux terminal network monitor inspired by nvtop. Live interface graphs, process traffic and keyboard-first setup, in one compact view.">
+  <meta name="theme-color" content="#0b1725">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="nettop — your network, in view">
+  <meta property="og:description" content="Live network traffic. A familiar terminal. Meet nettop for Linux.">
+  <meta property="og:url" content="https://nettop.wutz.io/">
+  <meta property="og:image" content="https://nettop.wutz.io/assets/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="nettop: your network in plain sight, with an actual DEMO terminal view">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://nettop.wutz.io/">
+  <link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/chivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+  <title>nettop — your network, in view</title>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="brand" href="#" aria-label="nettop home"><img src="assets/mark.svg" width="42" height="42" alt=""><span>nettop</span></a>
+    <nav aria-label="Main navigation"><a href="#inside">Inside nettop</a><a href="#install">Install</a><a class="github-link" href="https://github.com/itmitalles-de/nettop">GitHub <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 15 15 5M5 5h10v10"/></svg></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="intro"><span class="status-dot" aria-hidden="true"></span>At home in your terminal.</p>
+        <h1 id="hero-title">Your network.<br>In plain sight.</h1>
+        <p class="hero-description">See what’s flowing. Find what’s busy. A Linux network monitor with live graphs, process traffic, and the familiar feel of htop and nvtop.</p>
+        <div class="hero-actions"><a class="button primary" href="#install">Get nettop <span aria-hidden="true">↗</span></a><a class="text-link" href="#inside">Take a closer look</a></div>
+        <p class="hero-facts">Built in Rust <span aria-hidden="true">/</span> Made for Linux <span aria-hidden="true">/</span> MIT licensed</p>
+      </div>
+      <div class="hero-product">
+        <div class="product-note"><span><i class="rx-dot" aria-hidden="true"></i>Receive</span><span><i class="tx-dot" aria-hidden="true"></i>Send</span><span class="product-note-end">One compact view.</span></div>
+        <div class="terminal-window"><div class="window-bar"><span class="window-command"><span aria-hidden="true">❯</span> nettop --demo</span><span class="window-host">Linux / bash</span></div><img class="hero-terminal" src="assets/nettop-demo.png" width="665" height="456" alt="Actual nettop demo: green receive and yellow send history above the process traffic table" fetchpriority="high"></div>
+        <div class="product-caption"><span>Actual terminal output. Demo data.</span><a href="#demo-video">Watch it run <span aria-hidden="true">▷</span></a></div>
+      </div>
+    </section>
+
+    <section class="signal-strip" aria-label="Monitoring capabilities"><div class="wrap signal-grid">
+      <div><span class="signal-icon" aria-hidden="true">↧↥</span><p><strong>Follow the interface.</strong><span>RX and TX from Linux kernel counters.</span></p></div>
+      <div><span class="signal-icon" aria-hidden="true">▥</span><p><strong>Find the process.</strong><span>Captured traffic, matched to socket owners.</span></p></div>
+      <div><span class="signal-icon" aria-hidden="true">⌘</span><p><strong>Stay on the keyboard.</strong><span>Search, sort, switch. Keep your hands home.</span></p></div>
+    </div></section>
+
+    <section class="inside wrap" id="inside" aria-labelledby="inside-title">
+      <div class="section-intro"><h2 id="inside-title">Feels familiar.<br>Fits your workflow.</h2><p>Keep it in a split pane or give it the whole screen. nettop makes room for the traffic that matters, down to a 36 × 16 terminal.</p></div>
+      <div class="explorer">
+        <div class="explorer-controls">
+          <div class="view-tabs" role="tablist" aria-label="Explore nettop views">
+            <button id="tab-monitor" class="view-tab" role="tab" aria-selected="true" aria-controls="view-monitor" data-view="monitor"><span class="keycap" aria-hidden="true">↵</span><span><strong>The monitor</strong><small>Traffic up top. Processes below.</small></span></button>
+            <button id="tab-setup" class="view-tab" role="tab" aria-selected="false" aria-controls="view-setup" tabindex="-1" data-view="setup"><span class="keycap" aria-hidden="true">F2</span><span><strong>Make it yours</strong><small>Colors, graphs, units, and more.</small></span></button>
+            <button id="tab-sort" class="view-tab" role="tab" aria-selected="false" aria-controls="view-sort" tabindex="-1" data-view="sort"><span class="keycap" aria-hidden="true">F6</span><span><strong>Find the busy ones</strong><small>Pick a sort order. Follow the bytes.</small></span></button>
+          </div>
+          <p class="explorer-hint">Select a view to see the real interface.</p>
+          <div class="key-shortcuts"><p><kbd>/</kbd> Search the table</p><p><kbd>c</kbd> Inspect connections</p><p><kbd>b</kbd> Toggle bytes / bits</p><p><kbd>F12</kbd> Save your setup</p></div>
+        </div>
+        <div class="explorer-screen">
+          <div id="view-monitor" class="view-panel" role="tabpanel" aria-labelledby="tab-monitor" tabindex="0"><img src="assets/nettop-demo.png" width="665" height="456" loading="lazy" alt="nettop monitor in DEMO mode with traffic graphs and process rows"></div>
+          <div id="view-setup" class="view-panel" role="tabpanel" aria-labelledby="tab-setup" tabindex="0" hidden><img src="assets/nettop-setup.png" width="665" height="456" loading="lazy" alt="Actual F2 Setup with General, Interface, Chart and Processes categories"></div>
+          <div id="view-sort" class="view-panel" role="tabpanel" aria-labelledby="tab-sort" tabindex="0" hidden><img src="assets/nettop-sort.png" width="665" height="456" loading="lazy" alt="Actual F6 sort menu with traffic, RX, TX, total, PID and command choices"></div>
+          <p class="screen-caption">Native terminal colors. Your theme comes with you.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="setup-section" id="install" aria-labelledby="install-title"><div class="wrap install-grid">
+      <div class="install-copy"><h2 id="install-title">Set up once.<br>Just run nettop.</h2><p>Build from source, install to your user directory, and give the optional capture helper the access it needs. After that, start <code>nettop</code> as your regular user.</p><p class="requirements">You’ll need Linux and Rust 1.88+. The commands here use Ubuntu 24.04 or newer.</p><details><summary>What needs administrator access?</summary><p>Installing libpcap and setting up the capture helper requires administrator authentication once. The terminal UI has no capabilities and runs without sudo. Interface counters also work without the helper.</p><a href="https://github.com/itmitalles-de/nettop#install">Read how capture works</a></details><p class="access-note">The repository is currently private. Cloning requires GitHub access.</p></div>
+      <div class="install-terminal"><div class="code-heading"><span>Install from source</span><button class="copy-button" data-copy="install-command" type="button">Copy commands</button></div><pre id="install-command"><code><span class="code-comment"># Capture runtime + capability tools</span>
+sudo apt install libpcap0.8t64 libcap2-bin
+
+git clone https://github.com/itmitalles-de/nettop.git
+cd nettop
+./scripts/install.sh
+./scripts/setup-capture.sh
+
+<span class="code-comment"># From now on, no sudo</span>
+~/.local/bin/nettop</code></pre><div class="code-bottom"><span aria-hidden="true">❯</span><code>nettop --no-capture</code><span>Interface monitoring without setup.</span></div></div>
+    </div></section>
+
+    <section class="details-section wrap" aria-labelledby="details-title">
+      <div class="detail-copy"><h2 id="details-title">Real counters.<br>Clear boundaries.</h2><p>Interface rates come from Linux RX/TX counters. Process rates come from captured IP packets, matched to socket inodes and PIDs. Queue sizes never masquerade as traffic.</p><p>Short-lived, shared, or inaccessible sockets can remain unattributed. nettop shows unavailable rates and dropped packets instead of inventing numbers.</p><a class="text-link" href="https://github.com/itmitalles-de/nettop#what-the-numbers-mean">Understand the measurements</a></div>
+      <figure class="video-figure" id="demo-video"><video controls playsinline muted preload="none" poster="assets/nettop-demo.png" width="665" height="456" aria-label="Actual nettop DEMO recording showing the monitor, F2 Setup and F6 sorting"><source src="assets/nettop-demo.mp4" type="video/mp4"></video><figcaption>See the monitor, F2 Setup, and F6 sorting in an actual terminal recording. Synthetic DEMO traffic.</figcaption></figure>
+    </section>
+    <section class="closing wrap"><img src="assets/mark.svg" width="54" height="54" alt=""><h2>A small window into<br>what your network is doing.</h2><a class="button primary" href="#install">Make room for nettop <span aria-hidden="true">↗</span></a></section>
+  </main>
+  <footer class="site-footer wrap"><a class="brand" href="#" aria-label="Back to top">nettop<span class="version">v0.1.0</span></a><p>Made by <a href="https://itmitalles.de">itmitalles</a>. Inspired by <a href="https://github.com/htop-dev/htop">htop</a> and <a href="https://github.com/Syllo/nvtop">nvtop</a>.</p><a href="https://github.com/itmitalles-de/nettop">Source & documentation</a></footer>
+  <div id="copy-status" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>
