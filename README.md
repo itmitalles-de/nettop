@@ -11,11 +11,12 @@ process traffic capture. A libpcap development package is not required.
 
 ```bash
 # Ubuntu 24.04 and newer: needed for packet capture.
-sudo apt install libpcap0.8t64
+sudo apt install libpcap0.8t64 libcap2-bin
 
 git clone https://github.com/itmitalles-de/nettop.git
 cd nettop
 ./scripts/install.sh
+./scripts/setup-capture.sh       # One-time administrator authentication.
 ~/.local/bin/nettop
 ```
 
@@ -27,11 +28,38 @@ The installer builds with `cargo build --release --locked` and installs into
 installed by this script; it refuses to overwrite other files. Add
 `~/.local/bin` to your `PATH` to launch with `nettop`.
 
-For captured traffic and attribution to all accessible processes:
+After capture setup, start normally, including full process rates:
 
 ```bash
-sudo ~/.local/bin/nettop
+nettop
 ```
+
+### How capture works without sudo at startup
+
+Linux requires privileges to open a packet capture socket and read other users'
+socket descriptors. The optional setup script builds as your regular user, then
+uses the desktop authentication dialog (`pkexec`, or `sudo` on systems without
+it) only to install `/usr/local/libexec/nettop-collector`. Repeat setup when
+updating the helper. The UI installer never updates the privileged helper.
+
+The helper is root-owned, mode `0750`, and executable only by root and your
+primary group. Members of that group can monitor system-wide network metadata.
+Its only file capabilities are `CAP_NET_RAW`, `CAP_DAC_READ_SEARCH`, and
+`CAP_SYS_PTRACE`. The capture thread drops all capabilities after opening the
+capture socket; the sampling thread retains only the two capabilities needed to
+read `/proc/PID/fd`. Both lock out new privileges. Core dumps are disabled.
+
+The terminal UI has no capabilities. It starts the fixed helper over private
+stdin/stdout pipes; there is no background service, listening port, or arbitrary
+file/command API. Helper responses are bounded and interruptible. The helper
+ends with its UI. Running inside containers or sandboxes can prevent capability
+acquisition even after setup; this is reported instead of fabricating rates.
+
+Without setup, interface counters and accessible socket lists still work as your
+regular user. `--no-capture` explicitly bypasses the helper. Unavailable process
+rates are shown as unavailable. To revoke access, an administrator can remove
+`/usr/local/libexec/nettop-collector` and its
+`/usr/local/libexec/.nettop-collector.sha256` receipt.
 
 ## Use
 
@@ -84,6 +112,11 @@ bridge and its member interfaces.
 Attribution covers sockets accessible in the host network namespace. Processes
 in separate container network namespaces are not fully attributed. Capture
 inspects packet headers; nettop does not log payloads or perform DNS lookups.
+Socket ownership is sampled: short-lived, shared, or ambiguously reused sockets
+remain unattributed. Forwarded traffic is not assigned to unrelated host
+listeners. Multicast/broadcast receiver membership is not inferred from ports.
+Dual-stack wildcard sockets are matched to IPv4 only when Linux socket
+diagnostics confirm that the socket accepts IPv4.
 
 ## Development
 
@@ -92,18 +125,28 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
-shellcheck scripts/install.sh
+shellcheck scripts/*.sh
+python3 tests/terminal.py target/release/nettop
 
-# In an isolated Linux CI runner or test container with libpcap installed:
-sudo python3 tests/live_capture.py target/release/nettop
+# Isolated capture tests (Docker access required):
+docker build -t nettop-test tests
+docker run --rm --network none -v "$PWD:/work:ro" nettop-test \
+  python3 tests/live_capture.py target/release/nettop
+docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE \
+  -v "$PWD:/work:ro" nettop-test python3 tests/helper.py --isolated \
+  target/release/nettop target/release/nettop-collector
 ```
 
-CI runs formatting, linting, unit tests, a release build, and privileged capture
-checks on an Ubuntu 24.04 runner. The integration script uses only Python's
+CI runs formatting, linting, unit tests on stable and the minimum Rust 1.88.0,
+a release build, terminal restoration, and capture checks in isolated Ubuntu
+24.04 containers. The integration script uses only Python's
 standard library and loopback sockets: separate sender and receiver PIDs exchange
 real IPv4/IPv6 TCP and UDP traffic. It checks positive interface/process rates,
 PID attribution, packet drops, and duplicate counting without changing network
-configuration. Run these capture checks in an isolated test environment. See
+configuration. `tests/helper.py` additionally verifies capability separation,
+unprivileged cross-user attribution, installer checks, bounded protocol input,
+and shutdown with a stopped helper in an isolated container. Run capture and
+helper checks only in an isolated test environment. See
 [AGENTS.md](AGENTS.md) for repository-specific contributor instructions.
 
 MIT licensed. The project name is not intended to imply affiliation with other

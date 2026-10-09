@@ -112,7 +112,9 @@ impl Session {
         let handle = unsafe { (api.create)(device.as_ptr(), error_buffer.as_mut_ptr()) };
         if handle.is_null() {
             let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
-            bail!("sudo nettop for process rates; capture unavailable: {message}");
+            bail!(
+                "Process capture needs one-time setup (see README); capture unavailable: {message}"
+            );
         }
         // A session owns the handle even if a configuration step fails.
         let mut session = Self {
@@ -138,7 +140,7 @@ impl Session {
             if activated < 0 {
                 if activated == -8 || activated == -11 {
                     bail!(
-                        "sudo nettop for process rates; {}",
+                        "Process capture needs one-time setup (see README); {}",
                         session.api.message(handle)
                     );
                 }
@@ -226,6 +228,15 @@ impl Capture {
                         return;
                     }
                 };
+                // Capabilities belong to individual threads. Keep the open capture
+                // descriptor, but remove the worker's inherited privileges before
+                // publishing readiness or processing any packets.
+                if let Err(error) = crate::privilege::drop_capture_privileges() {
+                    let _ = sender.send(Err(format!(
+                        "dropping packet capture privileges: {error:#}"
+                    )));
+                    return;
+                }
                 if sender.send(Ok(session.datalink == 276)).is_err() {
                     return;
                 }

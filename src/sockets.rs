@@ -4,6 +4,7 @@ use super::packet::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,9 @@ pub(super) struct Socket {
     pub owners: Vec<Owner>,
     pub observed: Instant,
     pub current: bool,
+    // /proc/net/{tcp,udp}6 omits this per-socket option. Unknown is deliberately
+    // not treated as dual stack: an IPv6-only listener cannot own IPv4 traffic.
+    pub ipv6_only: Option<bool>,
 }
 
 impl Socket {
@@ -154,6 +158,10 @@ impl Inventory {
                     .unwrap_or_default();
             }
         }
+        let ipv6_modes = ipv6_socket_modes(&current);
+        for socket in &mut current {
+            socket.ipv6_only = ipv6_modes.get(&socket.key).copied();
+        }
         let live_keys: HashSet<_> = current.iter().map(|socket| socket.key.clone()).collect();
         for mut socket in self.sockets.drain(..) {
             if current.len() >= MAX_SOCKETS {
@@ -190,11 +198,15 @@ impl Inventory {
         let mut best = None;
         let mut best_score = 0;
         let mut ambiguous = false;
+        let mut matching_incarnations = 0;
+        let mut retained_match = false;
         for &index in candidates {
             let socket = &self.sockets[index];
-            let Some(score) = match_score(&socket.key, local, remote) else {
+            let Some(score) = match_score(socket, local, remote) else {
                 continue;
             };
+            matching_incarnations += 1;
+            retained_match |= !socket.current;
             if score > best_score {
                 best = Some(socket);
                 best_score = score;
@@ -205,7 +217,10 @@ impl Inventory {
                 ambiguous = true;
             }
         }
-        if ambiguous {
+        // A batch can straddle a close/rebind. Prefer neither incarnation when
+        // both match, even after both have closed: a retained connected socket
+        // must not steal a later wildcard socket's packets, or vice versa.
+        if ambiguous || (retained_match && matching_incarnations > 1) {
             None
         } else {
             best.filter(|socket| socket.owner().is_some())
@@ -220,28 +235,181 @@ impl Inventory {
     }
 }
 
-fn match_score(socket: &SocketKey, local: SocketAddr, remote: SocketAddr) -> Option<u8> {
-    if socket.local.port() != local.port() {
+fn match_score(socket: &Socket, local: SocketAddr, remote: SocketAddr) -> Option<u8> {
+    if socket.key.local.port() != local.port() {
         return None;
     }
-    let local_ip = canonical_ip(socket.local.ip());
+    let local_ip = canonical_ip(socket.key.local.ip());
     let packet_local = canonical_ip(local.ip());
     let local_score = if local_ip == packet_local {
         2
-    } else if local_ip.is_unspecified() && local_ip.is_ipv4() == packet_local.is_ipv4() {
+    } else if local_ip.is_unspecified()
+        && (local_ip.is_ipv4() == packet_local.is_ipv4()
+            || (local_ip.is_ipv6() && socket.ipv6_only == Some(false)))
+    {
         1
     } else {
         return None;
     };
-    let remote_ip = canonical_ip(socket.remote.ip());
+    let remote_ip = canonical_ip(socket.key.remote.ip());
     let packet_remote = canonical_ip(remote.ip());
-    if remote_ip.is_unspecified() && socket.remote.port() == 0 {
+    if remote_ip.is_unspecified() && socket.key.remote.port() == 0 {
         Some(local_score)
-    } else if remote_ip == packet_remote && socket.remote.port() == remote.port() {
+    } else if remote_ip == packet_remote && socket.key.remote.port() == remote.port() {
         Some(local_score + 4)
     } else {
         None
     }
+}
+
+/// SOCK_DIAG exposes IPV6_V6ONLY without opening another process's descriptor.
+/// Only wildcard IPv6 sockets need it; a denied/unsupported query leaves IPv4
+/// attribution unknown. Bound both elapsed time and retained response data.
+fn ipv6_socket_modes(sockets: &[Socket]) -> HashMap<SocketKey, bool> {
+    let wanted: HashSet<_> = sockets
+        .iter()
+        .filter(|socket| socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        .map(|socket| socket.key.clone())
+        .collect();
+    let mut modes = HashMap::new();
+    let deadline = Instant::now() + Duration::from_millis(50);
+    for protocol in [Protocol::Tcp, Protocol::Udp] {
+        if wanted.iter().any(|key| key.protocol == protocol) {
+            read_ipv6_modes(protocol, &wanted, &mut modes, deadline);
+        }
+    }
+    modes
+}
+
+fn read_ipv6_modes(
+    protocol: Protocol,
+    wanted: &HashSet<SocketKey>,
+    modes: &mut HashMap<SocketKey, bool>,
+    deadline: Instant,
+) {
+    // The request/response layouts are Linux UAPI inet_diag_req_v2 and
+    // inet_diag_msg. Integer headers are native endian; addresses/ports are not.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::NETLINK_SOCK_DIAG,
+        )
+    };
+    if raw < 0 {
+        return;
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut request = [0_u8; 72];
+    request[0..4].copy_from_slice(&72_u32.to_ne_bytes());
+    request[4..6].copy_from_slice(&20_u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY
+    request[6..8].copy_from_slice(&0x301_u16.to_ne_bytes()); // REQUEST | DUMP
+    request[8..12].copy_from_slice(&1_u32.to_ne_bytes());
+    request[16] = libc::AF_INET6 as u8;
+    request[17] = if protocol == Protocol::Tcp { 6 } else { 17 };
+    request[20..24].copy_from_slice(&u32::MAX.to_ne_bytes()); // All states.
+    request[64..72].fill(0xff); // INET_DIAG_NOCOOKIE
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    let sent = unsafe {
+        libc::sendto(
+            descriptor.as_raw_fd(),
+            request.as_ptr().cast(),
+            request.len(),
+            0,
+            (&kernel as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of_val(&kernel) as libc::socklen_t,
+        )
+    };
+    if sent != request.len() as isize {
+        return;
+    }
+    let mut buffer = [0_u8; 65_536];
+    while Instant::now() < deadline {
+        let mut ready = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .max(1) as i32;
+        if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
+            return;
+        }
+        let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut sender_len = std::mem::size_of_val(&sender) as libc::socklen_t;
+        let length = unsafe {
+            libc::recvfrom(
+                descriptor.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                (&mut sender as *mut libc::sockaddr_nl).cast(),
+                &mut sender_len,
+            )
+        };
+        if length <= 0 || length as usize > buffer.len() || sender.nl_pid != 0 {
+            return;
+        }
+        let mut messages = &buffer[..length as usize];
+        while messages.len() >= 16 {
+            let length = u32::from_ne_bytes(messages[..4].try_into().unwrap()) as usize;
+            if length < 16 || length > messages.len() {
+                return;
+            }
+            let kind = u16::from_ne_bytes(messages[4..6].try_into().unwrap());
+            let sequence = u32::from_ne_bytes(messages[8..12].try_into().unwrap());
+            if sequence != 1 || matches!(kind, 2 | 3) {
+                return; // NLMSG_ERROR / NLMSG_DONE
+            }
+            if kind == 20
+                && let Some((key, only)) = parse_ipv6_mode(&messages[16..length], protocol)
+                && wanted.contains(&key)
+            {
+                modes.insert(key, only);
+            }
+            let aligned = (length + 3) & !3;
+            messages = messages.get(aligned..).unwrap_or_default();
+        }
+    }
+}
+
+fn parse_ipv6_mode(message: &[u8], protocol: Protocol) -> Option<(SocketKey, bool)> {
+    if message.len() < 72 || message[0] != libc::AF_INET6 as u8 {
+        return None;
+    }
+    let key = SocketKey {
+        protocol,
+        inode: u32::from_ne_bytes(message[68..72].try_into().ok()?) as u64,
+        local: SocketAddr::new(
+            canonical_ip(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&message[8..24]).ok()?,
+            ))),
+            u16::from_be_bytes(message[4..6].try_into().ok()?),
+        ),
+        remote: SocketAddr::new(
+            canonical_ip(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&message[24..40]).ok()?,
+            ))),
+            u16::from_be_bytes(message[6..8].try_into().ok()?),
+        ),
+    };
+    let mut attributes = &message[72..];
+    while attributes.len() >= 4 {
+        let length = u16::from_ne_bytes(attributes[..2].try_into().ok()?) as usize;
+        let kind = u16::from_ne_bytes(attributes[2..4].try_into().ok()?);
+        if length < 4 || length > attributes.len() {
+            return None;
+        }
+        if kind == 11 && length == 5 {
+            // INET_DIAG_SKV6ONLY
+            return Some((key, attributes[4] != 0));
+        }
+        attributes = attributes.get(((length + 3) & !3)..)?;
+    }
+    None
 }
 
 pub(super) fn canonical_ip(ip: IpAddr) -> IpAddr {
@@ -286,6 +454,7 @@ fn parse_socket(line: &str, protocol: Protocol, ipv6: bool, now: Instant) -> Opt
         owners: Vec::new(),
         observed: now,
         current: true,
+        ipv6_only: None,
     })
 }
 
@@ -374,8 +543,14 @@ fn scan_owners(
                 limited = true;
                 break;
             }
-            let Ok(target) = fs::read_link(descriptor.path()) else {
-                continue;
+            let target = match fs::read_link(descriptor.path()) {
+                Ok(target) => target,
+                Err(error) => {
+                    // Directory listing and ptrace-gated symlink access are
+                    // separate permissions, notably for nondumpable processes.
+                    restricted |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                    continue;
+                }
             };
             let text = target.to_string_lossy();
             let Some(inode) = text
@@ -438,6 +613,25 @@ mod tests {
         }
     }
 
+    fn owned_socket(key: SocketKey, pid: u32, current: bool) -> Socket {
+        Socket {
+            key,
+            state: "BOUND".to_string(),
+            uid: 1000,
+            owners: vec![Owner {
+                identity: ProcessIdentity {
+                    pid,
+                    start_time: 100,
+                },
+                user: "test".to_string(),
+                name: "test".to_string(),
+            }],
+            observed: Instant::now(),
+            current,
+            ipv6_only: None,
+        }
+    }
+
     #[test]
     fn proc_addresses_use_native_endian_words() {
         let ipv4_word = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -462,12 +656,16 @@ mod tests {
         let local = "192.0.2.1:443".parse().unwrap();
         let remote = "198.51.100.2:23456".parse().unwrap();
         assert_eq!(
-            match_score(&key("0.0.0.0:443", "0.0.0.0:0", 1), local, remote),
+            match_score(
+                &owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 1), 1, true),
+                local,
+                remote
+            ),
             Some(1)
         );
         assert_eq!(
             match_score(
-                &key("192.0.2.1:443", "198.51.100.2:23456", 2),
+                &owned_socket(key("192.0.2.1:443", "198.51.100.2:23456", 2), 2, true),
                 local,
                 remote
             ),
@@ -475,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             match_score(
-                &key("192.0.2.1:443", "198.51.100.3:23456", 3),
+                &owned_socket(key("192.0.2.1:443", "198.51.100.3:23456", 3), 3, true),
                 local,
                 remote
             ),
@@ -501,6 +699,7 @@ mod tests {
                 }],
                 observed: Instant::now(),
                 current: true,
+                ipv6_only: None,
             });
         }
         inventory.index.insert((Protocol::Tcp, 443), vec![0, 1]);
@@ -525,6 +724,79 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn retained_connected_socket_cannot_steal_rebound_wildcard_traffic() {
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            for current in [true, false] {
+                let mut inventory = Inventory::new();
+                inventory.sockets = vec![
+                    owned_socket(key("192.0.2.1:53000", "198.51.100.2:53001", 1), 101, false),
+                    owned_socket(key("0.0.0.0:53000", "0.0.0.0:0", 2), 102, current),
+                ];
+                for socket in &mut inventory.sockets {
+                    socket.key.protocol = protocol;
+                }
+                inventory.index.insert((protocol, 53000), vec![0, 1]);
+                let local = "192.0.2.1:53000".parse().unwrap();
+                let remote = "198.51.100.2:53001".parse().unwrap();
+                assert!(inventory.resolve(protocol, local, remote).is_none());
+                // Once the conflicting incarnation expires, attribution resumes.
+                inventory.index.insert((protocol, 53000), vec![1]);
+                assert_eq!(
+                    inventory
+                        .resolve(protocol, local, remote)
+                        .unwrap()
+                        .owner()
+                        .unwrap()
+                        .identity
+                        .pid,
+                    102
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_matches_only_confirmed_dual_stack_wildcards() {
+        let mut socket = owned_socket(key("[::]:53000", "[::]:0", 1), 101, true);
+        let local = "127.0.0.1:53000".parse().unwrap();
+        let remote = "127.0.0.1:53001".parse().unwrap();
+        assert_eq!(match_score(&socket, local, remote), None);
+        socket.ipv6_only = Some(true);
+        assert_eq!(match_score(&socket, local, remote), None);
+        socket.ipv6_only = Some(false);
+        assert_eq!(match_score(&socket, local, remote), Some(1));
+        assert_eq!(
+            match_score(
+                &socket,
+                "[::1]:53000".parse().unwrap(),
+                "[::1]:53001".parse().unwrap()
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn socket_diagnostics_validate_attribute_lengths_and_addresses() {
+        let mut message = vec![0; 80];
+        message[0] = libc::AF_INET6 as u8;
+        message[4..6].copy_from_slice(&53000_u16.to_be_bytes());
+        message[68..72].copy_from_slice(&123_u32.to_ne_bytes());
+        message[72..74].copy_from_slice(&5_u16.to_ne_bytes());
+        message[74..76].copy_from_slice(&11_u16.to_ne_bytes());
+        let (socket, only) = parse_ipv6_mode(&message, Protocol::Udp).unwrap();
+        assert_eq!(socket.local, "[::]:53000".parse().unwrap());
+        assert_eq!(socket.inode, 123);
+        assert!(!only);
+        message[76] = 1;
+        assert!(parse_ipv6_mode(&message, Protocol::Udp).unwrap().1);
+        message[72..74].copy_from_slice(&3_u16.to_ne_bytes());
+        assert!(parse_ipv6_mode(&message, Protocol::Udp).is_none());
+        message[72..74].copy_from_slice(&100_u16.to_ne_bytes());
+        assert!(parse_ipv6_mode(&message, Protocol::Udp).is_none());
+        assert!(parse_ipv6_mode(&message[..40], Protocol::Udp).is_none());
     }
 
     #[test]

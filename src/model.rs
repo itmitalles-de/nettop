@@ -1,8 +1,8 @@
 //! Values shared by the collector, terminal UI and machine-readable output.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Interface {
     pub name: String,
     pub state: String,
@@ -20,7 +20,7 @@ pub struct Interface {
     pub dropped: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProcessRow {
     pub pid: Option<u32>,
     pub user: String,
@@ -32,7 +32,7 @@ pub struct ProcessRow {
     pub connections: usize,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConnectionRow {
     pub pid: Option<u32>,
     pub user: String,
@@ -47,14 +47,14 @@ pub struct ConnectionRow {
     pub tx_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CaptureStatus {
     pub active: bool,
     pub message: String,
     pub dropped: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
     pub elapsed: f64,
     pub interfaces: Vec<Interface>,

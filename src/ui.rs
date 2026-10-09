@@ -684,7 +684,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "DEMO data  |  live mode uses kernel counters".into()
     } else if !app.snapshot.capture.active {
         if app.snapshot.capture.message.is_empty() {
-            "Interface mode | sudo nettop for process rates".into()
+            "Interface mode | enable process rates with scripts/setup-capture.sh".into()
         } else {
             app.snapshot.capture.message.clone()
         }
@@ -975,7 +975,8 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from("Process totals are observed IP bytes this session."),
         Line::from("Shared, short-lived or inaccessible sockets can be unattributed."),
         Line::from("Virtual links can count the same traffic more than once in all mode."),
-        Line::from("Start with sudo nettop for full process attribution."),
+        Line::from("Enable process rates once: ./scripts/setup-capture.sh"),
+        Line::from("After setup, start nettop without sudo."),
         Line::from(""),
         Line::from(app.snapshot.capture.message.as_str()),
     ];

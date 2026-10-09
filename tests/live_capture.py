@@ -16,9 +16,11 @@ import sys
 import time
 
 
-def receiver(family, kind, control, finished, expected):
-    address = "127.0.0.1" if family == socket.AF_INET else "::1"
+def receiver(family, kind, control, finished, expected, dual_stack=False):
+    address = "::" if dual_stack else ("127.0.0.1" if family == socket.AF_INET else "::1")
     with socket.socket(family, kind) as listener:
+        if dual_stack:
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         listener.bind((address, 0))
         if kind == socket.SOCK_STREAM:
             listener.listen(1)
@@ -38,16 +40,22 @@ def receiver(family, kind, control, finished, expected):
                 connection.close()
 
 
-def run_case(binary, family, kind):
+def run_case(binary, family, kind, dual_stack=False):
     label = ("IPv4" if family == socket.AF_INET else "IPv6") + " " + (
         "TCP" if kind == socket.SOCK_STREAM else "UDP"
     )
+    if dual_stack:
+        label += " to dual-stack IPv6 wildcard"
     payload = b"n" * 1024
     packets = 128
     expected = len(payload) * packets
     parent, child = mp.Pipe()
     finished = mp.Event()
-    server = mp.Process(target=receiver, args=(family, kind, child, finished, expected))
+    receiver_family = socket.AF_INET6 if dual_stack else family
+    server = mp.Process(
+        target=receiver,
+        args=(receiver_family, kind, child, finished, expected, dual_stack),
+    )
     server.start()
     child.close()
     monitor = None
@@ -117,6 +125,7 @@ def main():
     for family in (socket.AF_INET, socket.AF_INET6):
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             run_case(binary, family, kind)
+    run_case(binary, socket.AF_INET, socket.SOCK_DGRAM, dual_stack=True)
     print("All live capture checks passed.")
 
 

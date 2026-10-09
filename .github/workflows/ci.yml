@@ -13,6 +13,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+      - name: Test minimum supported Rust
+        run: cargo +1.88.0 test --locked
   check:
     runs-on: ubuntu-24.04
     steps:
@@ -29,11 +39,18 @@ jobs:
         run: cargo +stable test --locked
       - name: Build release
         run: cargo +stable build --release --locked
-      - name: Install capture runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libpcap0.8t64
+      - name: Test terminal restoration
+        run: python3 tests/terminal.py target/release/nettop
+      - name: Build isolated capture environment
+        run: docker build --tag nettop-test tests
       - name: Test live TCP and UDP capture
-        run: sudo python3 tests/live_capture.py target/release/nettop
+        run: >-
+          docker run --rm --network none --volume "$PWD:/work:ro"
+          nettop-test python3 tests/live_capture.py target/release/nettop
+      - name: Test unprivileged UI and capability helper
+        run: >-
+          docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE
+          --volume "$PWD:/work:ro" nettop-test
+          python3 tests/helper.py --isolated target/release/nettop target/release/nettop-collector
       - name: Check installer
-        run: shellcheck scripts/install.sh
+        run: shellcheck scripts/*.sh

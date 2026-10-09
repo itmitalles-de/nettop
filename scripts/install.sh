@@ -74,4 +74,4 @@ mv -- "$staged_binary" "$destination"
 staged_binary=''
 mv -- "$staged_receipt" "$receipt"
 staged_receipt=''
-printf 'Installed %s\nStart: %s\nFull capture: sudo %s\n' "$destination" "$destination" "$destination"
+printf 'Installed %s\nStart: %s\nOptional one-time capture setup: %s/scripts/setup-capture.sh\n' "$destination" "$destination" "$repo_dir"

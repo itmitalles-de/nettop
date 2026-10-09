@@ -2,6 +2,7 @@
 name = "nettop"
 version = "0.1.0"
 edition = "2024"
+default-run = "nettop"
 rust-version = "1.88"
 description = "An nvtop-inspired Linux network monitor with live graphs and per-process traffic"
 license = "MIT"
@@ -16,6 +17,15 @@ libloading = "0.8"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+signal-hook = "0.3"
+
+[[bin]]
+name = "nettop"
+path = "src/main.rs"
+
+[[bin]]
+name = "nettop-collector"
+path = "src/bin/nettop-collector.rs"
 
 [profile.release]
 lto = "thin"

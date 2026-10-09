@@ -205,7 +205,7 @@ impl Collector {
                     } else {
                         Bytes { rx: 0, tx: bytes }
                     };
-                    let socket = socket_endpoints(&flow, receive)
+                    let socket = local_socket_endpoints(&flow, receive, &interfaces)
                         .and_then(|(local, remote)| {
                             self.inventory.resolve(flow.protocol, local, remote)
                         })
@@ -592,6 +592,23 @@ fn socket_endpoints(flow: &Flow, receive: bool) -> Option<(SocketAddr, SocketAdd
     })
 }
 
+fn local_socket_endpoints(
+    flow: &Flow,
+    receive: bool,
+    interfaces: &[KernelInterface],
+) -> Option<(SocketAddr, SocketAddr)> {
+    let (local, remote) = socket_endpoints(flow, receive)?;
+    // Captured interface direction is not proof of a local socket endpoint.
+    // Bridges, forwarding and container links also expose nonlocal traffic;
+    // matching it to a wildcard listener merely by port assigns the wrong PID.
+    // Multicast/broadcast receiver membership is not known from /proc, so leave
+    // those receive bytes unattributed too. Sender attribution remains possible.
+    interfaces
+        .iter()
+        .any(|interface| interface_has_ip(interface, local.ip()))
+        .then_some((local, remote))
+}
+
 fn process_row(owner: &Owner) -> ProcessRow {
     ProcessRow {
         pid: Some(owner.identity.pid),
@@ -873,6 +890,7 @@ mod tests {
             uid: 1000,
             observed: now,
             current: true,
+            ipv6_only: None,
             owners: vec![Owner {
                 identity: ProcessIdentity {
                     pid: 42,
@@ -987,5 +1005,23 @@ mod tests {
         assert!(snapshot.connections.is_empty());
         assert!(!snapshot.capture.active);
         assert!(snapshot.capture.message.starts_with("F2:"));
+    }
+
+    #[test]
+    fn forwarded_packets_cannot_match_host_wildcard_sockets() {
+        let interfaces = vec![interface(2, false, "192.0.2.1")];
+        let mut packet = flow(Direction::Incoming, 2);
+        packet.source = "198.51.100.1".parse().unwrap();
+        packet.destination = "203.0.113.2".parse().unwrap();
+        assert_eq!(traffic_sides(&packet, &interfaces), (true, false));
+        assert!(local_socket_endpoints(&packet, true, &interfaces).is_none());
+        packet.direction = Direction::Outgoing;
+        assert!(local_socket_endpoints(&packet, false, &interfaces).is_none());
+        packet.destination = "192.0.2.1".parse().unwrap();
+        assert!(local_socket_endpoints(&packet, true, &interfaces).is_some());
+        packet.destination = "224.0.0.251".parse().unwrap();
+        assert!(local_socket_endpoints(&packet, true, &interfaces).is_none());
+        packet.source = "192.0.2.1".parse().unwrap();
+        assert!(local_socket_endpoints(&packet, false, &interfaces).is_some());
     }
 }

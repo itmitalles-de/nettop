@@ -3,6 +3,18 @@
 `main.rs` owns CLI validation, source selection, refresh timing and terminal
 restoration. `ui.rs` receives snapshots and draws the nvtop-style layout; it
 never derives measurements from queue lengths or substitutes demo values.
+`shutdown.rs` registers cooperative SIGINT/SIGTERM/SIGHUP handlers so raw mode,
+the alternate screen and the cursor are restored even with long refresh periods.
+
+Normal-user capture uses the optional root-owned, group-restricted
+`/usr/local/libexec/nettop-collector`. `helper.rs` provides a versioned, bounded
+stdio protocol; replies have a deadline and cancellation so a stalled helper
+cannot trap the UI. `privilege.rs` drops per-thread capabilities: the capture
+worker keeps none after opening pcap; the sampling thread keeps only
+DAC_READ_SEARCH and SYS_PTRACE for process descriptors. Both set NO_NEW_PRIVS.
+`scripts/setup-capture.sh` builds unprivileged, authenticates only for root-owned
+installation, verifies the staged digest and refuses untracked replacements.
+The UI itself never receives capabilities or elevated user IDs.
 
 `collector.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs.
 Interface rates are monotonic counter deltas divided by the measured interval.
@@ -23,6 +35,9 @@ and `/proc/PID/fd` socket inodes. Identity includes PID and start time. Owners a
 scanned at most once per second; closed sockets survive briefly for late packets.
 Ambiguous and shared ownership remains unattributed. Current sockets retain
 totals through idle periods; expired closed entries and all maps are bounded.
+Overlapping socket incarnations involving retained matches stay unattributed.
+Only local endpoints can match host sockets. Bounded SOCK_DIAG queries supply
+IPv6 wildcard V6ONLY metadata; missing metadata never implies dual-stack support.
 
 The live integration harness sends known payloads between separate processes on
 loopback. It checks each transport/address family, both process directions,

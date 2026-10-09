@@ -8,7 +8,9 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
 use nettop::{
     collector::{Collector, default_interface},
+    helper::Client,
     model::Snapshot,
+    shutdown::SignalGuard,
     ui::{self, Action, App},
 };
 
@@ -56,13 +58,15 @@ fn parse_interval(value: &str) -> Result<f64, String> {
 
 enum Source {
     Live(Box<Collector>),
+    Helper(Client),
     Demo { tick: u64, start: Instant },
 }
 
 impl Source {
-    fn sample(&mut self, interface: Option<&str>) -> Result<Snapshot> {
+    fn sample(&mut self, interface: Option<&str>, shutdown: &SignalGuard) -> Result<Snapshot> {
         match self {
             Self::Live(collector) => collector.sample(interface),
+            Self::Helper(client) => client.sample(interface, || shutdown.requested()),
             Self::Demo { tick, start } => {
                 let snapshot = ui::demo_snapshot(*tick, start.elapsed().as_secs_f64());
                 *tick += 1;
@@ -74,13 +78,23 @@ impl Source {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let shutdown = SignalGuard::new().context("registering shutdown handlers")?;
     if !cfg!(target_os = "linux") && !args.demo {
         bail!("live monitoring requires Linux");
     }
+    let mut helper_error = None;
     let mut source = if args.demo {
         Source::Demo {
             tick: 0,
             start: Instant::now(),
+        }
+    } else if !args.no_capture && unsafe { libc::geteuid() } != 0 {
+        match Client::start() {
+            Ok(client) => Source::Helper(client),
+            Err(error) => {
+                helper_error = Some(error);
+                Source::Live(Box::new(Collector::new(true)?))
+            }
         }
     } else {
         Source::Live(Box::new(
@@ -93,7 +107,22 @@ fn main() -> Result<()> {
         None if args.demo => Some("enp112s0".into()),
         None => default_interface(),
     };
-    let first = source.sample(interface.as_deref())?;
+    let first = match source.sample(interface.as_deref(), &shutdown) {
+        Ok(snapshot) => snapshot,
+        Err(_) if shutdown.requested() => return Ok(()),
+        Err(error) if matches!(source, Source::Helper(_)) => {
+            // A revoked/outdated helper must not prevent interface monitoring.
+            helper_error = Some(error);
+            source = Source::Live(Box::new(Collector::new(true)?));
+            source.sample(interface.as_deref(), &shutdown)?
+        }
+        Err(error) => return Err(error),
+    };
+    if !first.capture.active
+        && let Some(error) = helper_error
+    {
+        eprintln!("Capture setup: {error:#}. Run scripts/setup-capture.sh once; see README.");
+    }
     if let Some(name) = &interface
         && !first.interfaces.iter().any(|iface| &iface.name == name)
     {
@@ -108,8 +137,21 @@ fn main() -> Result<()> {
         );
     }
     if args.once || args.json {
-        std::thread::sleep(Duration::from_secs_f64(args.interval));
-        let snapshot = source.sample(interface.as_deref())?;
+        let deadline = Instant::now() + Duration::from_secs_f64(args.interval);
+        while Instant::now() < deadline {
+            if shutdown.requested() {
+                return Ok(());
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
+        }
+        let snapshot = match source.sample(interface.as_deref(), &shutdown) {
+            Err(_) if shutdown.requested() => return Ok(()),
+            result => result?,
+        };
         if args.json {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         } else {
@@ -128,9 +170,10 @@ fn main() -> Result<()> {
         &mut source,
         &mut app,
         Duration::from_secs_f64(args.interval),
+        &shutdown,
     );
     ratatui::restore();
-    result
+    if shutdown.requested() { Ok(()) } else { result }
 }
 
 fn run(
@@ -138,16 +181,34 @@ fn run(
     source: &mut Source,
     app: &mut App,
     interval: Duration,
+    shutdown: &SignalGuard,
 ) -> Result<()> {
     let mut next_sample = Instant::now() + interval;
-    loop {
+    'running: loop {
+        if shutdown.requested() {
+            break;
+        }
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(next_sample.saturating_duration_since(Instant::now()))? {
+        // Poll frequently for external termination without repainting between
+        // events or samples. Even a 60-second interval exits promptly.
+        let event_ready = loop {
+            if shutdown.requested() {
+                break 'running;
+            }
+            let remaining = next_sample.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            if event::poll(remaining.min(Duration::from_millis(100)))? {
+                break true;
+            }
+        };
+        if event_ready {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match app.handle_key(key) {
                     Action::Quit => break,
                     Action::InterfaceChanged => {
-                        app.update(source.sample(app.interface.as_deref())?);
+                        app.update(source.sample(app.interface.as_deref(), shutdown)?);
                         next_sample = Instant::now() + interval;
                     }
                     Action::None => {}
@@ -157,7 +218,7 @@ fn run(
             }
         }
         if Instant::now() >= next_sample {
-            app.update(source.sample(app.interface.as_deref())?);
+            app.update(source.sample(app.interface.as_deref(), shutdown)?);
             next_sample = Instant::now() + interval;
         }
     }
