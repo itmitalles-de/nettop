@@ -40,3 +40,7 @@
   licensed fonts. Pages is configured as public with custom domain
   `nettop.wutz.io`; the source repository remains private. The Pages workflow
   deploys static files independently of Rust CI and its container dependencies.
+- GitHub approved the custom-domain certificate and HTTPS enforcement is enabled.
+  DNS points directly to `itmitalles-de.github.io` without Cloudflare proxying.
+  Pages deployments probe the public HTTPS page after publication. The full Rust
+  CI, including isolated capture/helper tests and Rust 1.88, passed for the site work.

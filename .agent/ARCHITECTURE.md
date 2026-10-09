@@ -52,5 +52,6 @@ from the repository.
 The public project website is a dependency-free static site in `site/`, deployed
 by `.github/workflows/pages.yml` from `main`. Only `site/` is uploaded to Pages;
 the source repository remains private. `nettop.wutz.io` is a DNS-only Cloudflare
-CNAME to `itmitalles-de.github.io`. The site uses local fonts and explicit DEMO
+CNAME to `itmitalles-de.github.io`, with HTTPS enforced by Pages. Deployment checks
+the public HTTPS endpoint. The site uses local fonts and explicit DEMO
 captures as intentional public product assets; local QA evidence stays outside Git.
