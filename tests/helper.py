@@ -30,6 +30,7 @@ import subprocess
 import tempfile
 import termios
 import time
+from unittest.mock import patch
 
 
 HELPER = Path("/usr/local/libexec/nettop-collector")
@@ -412,13 +413,20 @@ def main():
             build = Path(directory) / "nettop-collector"
             shutil.copy2(helper_binary, build)
             os.chown(build, account.pw_uid, account.pw_gid)
-            check_installer(script, build, account)
-            check_capture(binary, account)
-            check_no_capture(binary, account)
-            check_protocol(account)
-            check_stopped_helper(binary, account)
-            check_stopped_helper(binary, account, signal_exit=False)
-            check_abrupt_exit(binary, account)
+            # Popen(user=...) changes credentials but inherits root's environment.
+            # Give the UI a private, accessible preferences directory instead of
+            # resolving settings underneath the test runner's root home.
+            config_home = Path(directory) / "preferences"
+            config_home.mkdir(mode=0o700)
+            os.chown(config_home, account.pw_uid, account.pw_gid)
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config_home)}):
+                check_installer(script, build, account)
+                check_capture(binary, account)
+                check_no_capture(binary, account)
+                check_protocol(account)
+                check_stopped_helper(binary, account)
+                check_stopped_helper(binary, account, signal_exit=False)
+                check_abrupt_exit(binary, account)
     finally:
         # These paths were absent before this explicitly isolated test started.
         for path in (HELPER, RECEIPT):
