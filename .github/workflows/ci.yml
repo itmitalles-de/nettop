@@ -41,6 +41,8 @@ jobs:
         run: cargo +stable build --release --locked
       - name: Test terminal restoration
         run: python3 tests/terminal.py target/release/nettop
+      - name: Test Setup and saved preferences
+        run: python3 tests/setup.py target/release/nettop
       - name: Build isolated capture environment
         run: docker build --tag nettop-test tests
       - name: Test live TCP and UDP capture

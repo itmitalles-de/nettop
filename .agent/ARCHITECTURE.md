@@ -3,6 +3,10 @@
 `main.rs` owns CLI validation, source selection, refresh timing and terminal
 restoration. `ui.rs` receives snapshots and draws the nvtop-style layout; it
 never derives measurements from queue lengths or substitutes demo values.
+`config.rs` owns versioned user preferences, XDG path resolution and atomic
+private writes. `main.rs` applies explicit CLI overrides after loading preferences;
+F2 edits them live and F12 saves them. The collector never loads this configuration.
+UI colors use native ANSI colors and inverse styles, inheriting the terminal theme.
 `shutdown.rs` registers cooperative SIGINT/SIGTERM/SIGHUP handlers so raw mode,
 the alternate screen and the cursor are restored even with long refresh periods.
 

@@ -2,7 +2,9 @@
 
 A Linux terminal network monitor inspired by **nvtop**: compact interface
 statistics, a green RX / yellow TX history graph, and a sortable process or
-connection table. The layout adapts to narrow terminals, including 40 × 24.
+connection table. Native terminal colors, stepped graphs, inverse table headers,
+and a function-key bar follow htop/nvtop. The layout adapts to narrow terminals,
+including 36 × 16 and 52 × 18.
 
 ## Install
 
@@ -69,6 +71,8 @@ nettop --interface all           # Aggregate all monitored interfaces.
 nettop --no-capture              # Interface rates and sockets; no packet capture.
 nettop --interval 0.5 --history 90
 nettop --bits                    # Display rates in bits per second.
+nettop --bytes                   # Override saved bit/s units.
+nettop --no-color                # Use a monochrome display.
 nettop --once                    # Print one measured snapshot and exit.
 nettop --json                    # Machine-readable snapshot, then exit.
 nettop --demo                    # Explicit synthetic UI preview labeled DEMO.
@@ -81,19 +85,44 @@ The refresh interval defaults to one second (`--interval`, or `-d`, accepts
 | Key | Action |
 | --- | --- |
 | `F1` / `?` | Help |
-| `F2` / `i` | Open the interface picker; choose with arrows and `Enter` |
+| `F2` | Open Setup |
+| `F5` / `i` | Open the interface picker; choose with arrows and `Enter` |
 | `Tab` / `Shift+Tab` | Cycle active interfaces and loopback |
 | `F3` / `/` | Search the table |
-| `F6` / `s` | Cycle sorting |
-| `c` | Switch between processes and connections |
+| `F6` | Choose a sort column with arrows and `Enter` |
+| `s` | Cycle sorting |
+| `F4` / `c` | Switch between processes and connections |
 | `b` | Toggle bytes / bits |
-| `Space` | Pause the display |
+| `F9` / `Space` | Pause the display |
+| `F12` | Save current settings |
 | `↑` / `↓`, `k` / `j` | Move through the table |
 | `Page Up` / `Page Down`, `Home` / `End` | Move by a page or jump to the ends |
 | `Enter` / `Esc` | Finish search / clear the search or close a picker |
-| `q` / `F10` / `Ctrl+C` | Quit (`q` closes an open help/picker) |
+| `q` / `F10` / `Ctrl+C` | Quit (`q` closes overlays; `F10` returns from Setup) |
 
 The help overlay scrolls with `↑` / `↓` and `Page Up` / `Page Down`.
+
+### Setup and saved preferences
+
+`F2` opens a two-pane Setup screen with General, Interface, Chart, and Processes
+categories. Set the refresh interval, units, interface, graph visibility/history,
+Steps or Braille drawing, RX/TX colors, process/connection view, sorting, and idle
+row visibility. The default colors use the terminal's own green, yellow, and cyan
+palette, so they match htop/nvtop in the same terminal theme.
+
+Use `↑` / `↓` to navigate and `Tab` or `→` to enter the options pane. `Enter`,
+`Space`, or `+` changes a value; `-` goes backward. `←` returns to the categories.
+Changes apply immediately. `F10` or `Esc` returns to monitoring; `F12` saves.
+Exiting without `F12` keeps changes only for this session.
+
+Settings are saved atomically with private file permissions to
+`$XDG_CONFIG_HOME/nettop/config.json`, or `~/.config/nettop/config.json` when the
+XDG variable is unset. Explicit CLI options override saved preferences for that
+run; pressing `F12` saves the current values, including those overrides.
+`--no-color` and a nonempty `NO_COLOR` environment variable start in monochrome.
+Malformed or unsupported settings produce a warning and use defaults; saving
+will preserve the original file until it is fixed or moved aside. A saved
+interface that no longer exists falls back to automatic selection with a warning.
 
 ## What the rates mean
 
@@ -127,6 +156,7 @@ cargo test --locked
 cargo build --release --locked
 shellcheck scripts/*.sh
 python3 tests/terminal.py target/release/nettop
+python3 tests/setup.py target/release/nettop
 
 # Isolated capture tests (Docker access required):
 docker build -t nettop-test tests
@@ -138,7 +168,7 @@ docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE \
 ```
 
 CI runs formatting, linting, unit tests on stable and the minimum Rust 1.88.0,
-a release build, terminal restoration, and capture checks in isolated Ubuntu
+a release build, terminal restoration, Setup/persistence checks, and capture checks in isolated Ubuntu
 24.04 containers. The integration script uses only Python's
 standard library and loopback sockets: separate sender and receiver PIDs exchange
 real IPv4/IPv6 TCP and UDP traffic. It checks positive interface/process rates,
