@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Lint
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Build release
+        run: cargo +stable build --release --locked
+      - name: Install capture runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libpcap0.8t64
+      - name: Test live TCP and UDP capture
+        run: sudo python3 tests/live_capture.py target/release/nettop
+      - name: Check installer
+        run: shellcheck scripts/install.sh
