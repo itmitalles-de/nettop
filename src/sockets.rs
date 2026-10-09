@@ -259,7 +259,7 @@ fn parse_address(value: &str, ipv6: bool) -> Option<SocketAddr> {
             return None;
         }
         let mut bytes = [0; 16];
-        for (index, chunk) in hex_ip.as_bytes().chunks_exact(8).enumerate() {
+        for (index, chunk) in hex_ip.as_bytes().as_chunks::<8>().0.iter().enumerate() {
             let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
             bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
