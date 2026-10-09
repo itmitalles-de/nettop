@@ -691,11 +691,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         0
     };
+    let status = status_line(app);
     let layout = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(graph_height),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(status.is_some())),
         Constraint::Min(4),
         Constraint::Length(1),
     ])
@@ -703,7 +704,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_title(frame, app, layout[0]);
     draw_device(frame, app, layout[1]);
     draw_graph(frame, app, layout[2]);
-    draw_status(frame, app, layout[3]);
+    if let Some((text, color)) = status {
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(color)),
+            layout[3],
+        );
+    }
     draw_table(frame, app, layout[4]);
     draw_footer(frame, app, layout[5]);
     match app.overlay {
@@ -732,7 +738,6 @@ fn draw_title(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::raw(" ["),
         Span::raw(app.interface.as_deref().unwrap_or("all interfaces")),
         Span::raw("]"),
-        Span::styled("  nettop", Style::default().fg(DIM)),
     ];
     if app.demo {
         spans.push(Span::styled("  DEMO", Style::default().fg(Color::Magenta)));
@@ -1042,43 +1047,52 @@ fn draw_step_graph(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .set_stringn(plot.right() - 2, label_y, "0s", 2, Style::default());
 }
 
-fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let text = if let Some(notice) = &app.notice {
-        notice.clone()
-    } else if app.searching {
-        format!("Search: {}_  Enter apply / Esc clear", app.filter)
-    } else if app.demo {
-        "DEMO data  |  live mode uses kernel counters".into()
-    } else if !app.snapshot.capture.active {
-        if app.snapshot.capture.message.is_empty() {
+fn status_line(app: &App) -> Option<(String, Color)> {
+    if let Some(notice) = &app.notice {
+        return Some((
+            notice.clone(),
+            if app.notice_error { Color::Red } else { KEY },
+        ));
+    }
+    if app.searching {
+        return Some((
+            format!("Search: {}_  Enter apply / Esc clear", app.filter),
+            KEY,
+        ));
+    }
+    if !app.filter.is_empty() {
+        return Some((format!("Filter: {}  Esc clears", app.filter), KEY));
+    }
+    if app.demo {
+        return None; // The device header already identifies synthetic data.
+    }
+    if !app.snapshot.capture.active {
+        let message = if app.snapshot.capture.message.is_empty() {
             "Interface mode | enable process rates with scripts/setup-capture.sh".into()
         } else {
             app.snapshot.capture.message.clone()
-        }
-    } else if app.snapshot.capture.dropped > 0 {
-        format!(
-            "Capture: {} dropped packets | rates incomplete",
-            app.snapshot.capture.dropped
-        )
-    } else {
-        app.snapshot.capture.message.clone()
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(if app.notice.is_some() {
-            if app.notice_error { Color::Red } else { KEY }
-        } else if app.searching {
-            KEY
-        } else if !app.snapshot.capture.active {
-            TX
-        } else {
-            DIM
-        })),
-        area,
-    );
+        };
+        return Some((message, TX));
+    }
+    if app.snapshot.capture.dropped > 0 {
+        return Some((
+            format!(
+                "Capture: {} dropped packets | rates incomplete",
+                app.snapshot.capture.dropped
+            ),
+            TX,
+        ));
+    }
+    // Existing helpers combine a routine explanation with runtime warnings.
+    // Keep the explanation in F1 Help and preserve any appended warning.
+    let message = app.snapshot.capture.message.strip_prefix(
+        "Process rates: captured IP bytes; socket/PID owners sampled, brief sockets may be unattributed"
+    ).unwrap_or(&app.snapshot.capture.message).trim_start_matches("; ");
+    (!message.is_empty()).then(|| (message.to_string(), TX))
 }
 
 fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    app.visible_rows = usize::from(area.height.saturating_sub(3));
+    app.visible_rows = usize::from(area.height.saturating_sub(1));
     let wide = area.width >= 94;
     let medium = area.width >= 52;
     let captured = app.snapshot.capture.active || app.demo;
@@ -1236,20 +1250,6 @@ fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
     };
     let count = rows.len();
-    let title = format!(
-        " {} ({count})  sort: {}{} ",
-        if app.settings.connections {
-            "Connections"
-        } else {
-            "Processes"
-        },
-        app.settings.sort.label(),
-        if app.filter.is_empty() {
-            String::new()
-        } else {
-            format!("  /{}", app.filter)
-        }
-    );
     let header = Row::new(headers.into_iter().map(|header| {
         if matches!(header, "PID" | "RX/s" | "TX/s" | "TOTAL" | "CONN") {
             number_cell(header.into())
@@ -1261,15 +1261,9 @@ fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(DIM))
-                .title(title),
-        )
         .row_highlight_style(inverse(KEY));
     frame.render_stateful_widget(table, area, &mut app.table);
-    if count == 0 && area.height > 3 {
+    if count == 0 && area.height > 1 {
         let message = if app.filter.is_empty() {
             "Waiting for network activity..."
         } else {
@@ -1279,7 +1273,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Paragraph::new(message).style(Style::default().fg(DIM)),
             Rect {
                 x: area.x,
-                y: area.y + 2,
+                y: area.y + 1,
                 width: area.width,
                 height: 1,
             },
@@ -1695,7 +1689,10 @@ mod tests {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-            assert!(text.contains("nettop"), "title missing at {width}x{height}");
+            assert!(
+                text.contains("Device "),
+                "title missing at {width}x{height}"
+            );
             assert!(text.contains("RX/s"), "rates missing at {width}x{height}");
             assert!(
                 text.contains("Quit"),

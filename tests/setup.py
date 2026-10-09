@@ -59,7 +59,7 @@ class Terminal:
                 start_new_session=True,
             )
             self.wait_for(
-                lambda: b"nettop" in self.output and b"\x1b[?1049h" in self.output,
+                lambda: b"Device" in self.output and b"\x1b[?1049h" in self.output,
                 "monitor startup",
             )
             return self
@@ -166,7 +166,7 @@ def persistence_and_overrides(binary, config_home):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, "saved settings are not private"
         terminal.expect(b"Saved ")
         mark = terminal.send(F10)
-        terminal.expect(b"Processes", mark)
+        terminal.expect(b"RX/s", mark)
         assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit nettop"
         terminal.quit()
 
@@ -212,7 +212,7 @@ def malformed_settings(binary, config_home):
         assert path.read_bytes() == original, "F12 discarded the malformed settings file"
         assert list(path.parent.iterdir()) == [path], "failed save left temporary files"
         mark = terminal.send(F10)
-        terminal.expect(b"Processes", mark)
+        terminal.expect(b"RX/s", mark)
         terminal.quit()
     assert path.read_bytes() == original, "exit overwrote malformed settings"
     print("PASS invalid settings: visible warning, usable defaults, original file preserved")

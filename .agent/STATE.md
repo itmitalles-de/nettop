@@ -6,6 +6,9 @@
   inverse green headers, cyan selection and function-key bar. F2 opens persistent
   Setup; F5 selects an interface, F6 selects sorting, F12 saves preferences.
   Layout tests cover 36x16, 40x24, 52x18, 80x24 and 120x36, including Setup.
+- The device header omits the redundant app name. Table rows follow the graph
+  directly; routine capture and table-summary lines are hidden. Notices, active
+  filters and capture warnings can temporarily use one status row; details are in F1.
 - Preferences use `$XDG_CONFIG_HOME/nettop/config.json` or
   `~/.config/nettop/config.json`, with atomic private writes. CLI options override
   saved values; malformed files stay intact. The helper never reads preferences.

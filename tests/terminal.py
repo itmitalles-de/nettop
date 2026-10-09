@@ -41,7 +41,7 @@ def run_case(binary, exit_signal):
             start_new_session=True,
         )
         deadline = time.monotonic() + 5
-        while b"nettop" not in output or b"\x1b[?1049h" not in output:
+        while b"Device" not in output or b"\x1b[?1049h" not in output:
             assert child.poll() is None, f"{label}: monitor exited during startup: {output!r}"
             assert time.monotonic() < deadline, f"{label}: monitor did not draw: {output!r}"
             read_available(master, output, 0.05)

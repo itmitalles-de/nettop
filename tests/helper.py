@@ -225,7 +225,7 @@ def check_stopped_helper(binary, account, signal_exit=True):
             **unprivileged(account),
         )
         deadline = time.monotonic() + 5
-        while b"nettop" not in output or b"\x1b[?1049h" not in output:
+        while b"Device" not in output or b"\x1b[?1049h" not in output:
             assert monitor.poll() is None, f"PTY monitor exited: {output!r}"
             assert time.monotonic() < deadline, f"PTY monitor did not draw: {output!r}"
             read_terminal(master, output, 0.05)
@@ -294,7 +294,7 @@ def check_abrupt_exit(binary, account):
             **unprivileged(account),
         )
         deadline = time.monotonic() + 5
-        while b"nettop" not in output or b"\x1b[?1049h" not in output:
+        while b"Device" not in output or b"\x1b[?1049h" not in output:
             assert monitor.poll() is None, f"PTY monitor exited: {output!r}"
             assert time.monotonic() < deadline, f"PTY monitor did not draw: {output!r}"
             read_terminal(master, output, 0.05)

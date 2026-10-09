@@ -101,6 +101,9 @@ The refresh interval defaults to one second (`--interval`, or `-d`, accepts
 | `q` / `F10` / `Ctrl+C` | Quit (`q` closes overlays; `F10` returns from Setup) |
 
 The help overlay scrolls with `↑` / `↓` and `Page Up` / `Page Down`.
+The table starts directly below the graph. Routine capture details are in `F1`
+Help; an extra status row appears only for notices, search/filter state or capture
+warnings.
 
 ### Setup and saved preferences
 
