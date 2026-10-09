@@ -1,6 +1,6 @@
 # Verified state
 
-- New private repository: `itmitalles-de/nettop`, branch `main`.
+- Public, MIT-licensed repository: `itmitalles-de/nettop`, branch `main`.
 - Rust 1.88+ Linux binary, runtime-loaded libpcap; no libpcap development package.
 - Native ANSI htop/nvtop styling: green RX, yellow TX, stepped history graph,
   inverse green headers, cyan selection and function-key bar. F2 opens persistent
@@ -38,7 +38,7 @@
 - The redesigned README shares the site's banner and explicit DEMO image.
   `site/` contains the responsive project website, terminal recording and local
   licensed fonts. Pages is configured as public with custom domain
-  `nettop.wutz.io`; the source repository remains private. The Pages workflow
+  `nettop.wutz.io`; the source repository is also public. The Pages workflow
   deploys static files independently of Rust CI and its container dependencies.
 - GitHub approved the custom-domain certificate and HTTPS enforcement is enabled.
   DNS points directly to `itmitalles-de.github.io` without Cloudflare proxying.

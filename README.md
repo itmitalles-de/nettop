@@ -47,8 +47,8 @@ Interface counters also work without that setup.
 ## Install
 
 You need **Linux**, **Rust 1.88+**, and the **libpcap runtime** for process capture.
-A libpcap development package is not required. The repository is currently
-private; cloning requires GitHub access to it.
+A libpcap development package is not required. The source is public and
+[MIT licensed](LICENSE); cloning does not require a GitHub account.
 
 ```bash
 # Ubuntu 24.04 and newer: capture runtime and capability tools.
