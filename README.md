@@ -10,9 +10,9 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-Linux-81c784?style=flat-square&amp;labelColor=111827" alt="Platform: Linux">
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-1.88%2B-f4d35e?style=flat-square&amp;labelColor=111827" alt="Rust 1.88 or newer"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-81c784?style=flat-square&amp;labelColor=111827" alt="MIT license"></a>
+  <img src="site/assets/badge-linux.svg" alt="Platform: Linux">
+  <a href="Cargo.toml"><img src="site/assets/badge-rust.svg" alt="Rust 1.88 or newer"></a>
+  <a href="LICENSE"><img src="site/assets/badge-license.svg" alt="MIT license"></a>
 </p>
 
 <p align="center">
