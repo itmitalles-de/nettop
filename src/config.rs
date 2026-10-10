@@ -251,7 +251,7 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         if self.version != VERSION {
             bail!(
-                "unsupported settings version {}; this nettop supports version {VERSION}",
+                "unsupported settings version {}; this nwtop supports version {VERSION}",
                 self.version
             );
         }
@@ -284,15 +284,15 @@ pub struct Loaded {
 }
 
 /// Saving or loading as root in another user's settings directory, typically
-/// after `sudo -E nettop`, would create root-owned files there.
+/// after `sudo -E nwtop`, would create root-owned files there.
 #[derive(Debug)]
 pub struct RootWithForeignSettings;
 
 impl std::fmt::Display for RootWithForeignSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
-            "nettop runs as root, but the settings directory belongs to another user \
-             (for example after sudo -E); start nettop without sudo to change preferences",
+            "nwtop runs as root, but the settings directory belongs to another user \
+             (for example after sudo -E); start nwtop without sudo to change preferences",
         )
     }
 }
@@ -315,6 +315,7 @@ struct StoredRef<'a> {
 #[derive(Clone, Debug)]
 pub struct ConfigFile {
     path: PathBuf,
+    legacy_path: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -331,11 +332,17 @@ impl ConfigFile {
                 PathBuf::from(home).join(".config")
             }
         };
-        Ok(Self::at(base.join("nettop/config.json")))
+        Ok(Self {
+            path: base.join("nwtop/config.json"),
+            legacy_path: Some(base.join("nettop/config.json")),
+        })
     }
 
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            legacy_path: None,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -358,21 +365,40 @@ impl ConfigFile {
     }
 
     fn load_inner(&self) -> Result<Loaded> {
-        let (parent, name) = self.location()?;
-        let directory = match open_directory(parent) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Loaded::default());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        validate_directory(&directory)?;
-        Ok(read_settings(&directory, &name)?
+        Ok(self
+            .read_with_legacy()?
             .map(|stored| Loaded {
                 unknown_keys: stored.extra.keys().cloned().collect(),
                 settings: stored.settings,
             })
             .unwrap_or_default())
+    }
+
+    /// The old name is read only when the new file is absent. Malformed or
+    /// unsafe files never silently fall back, and saving always uses nwtop.
+    fn read_with_legacy(&self) -> Result<Option<Stored>> {
+        match self.read_stored()? {
+            Some(stored) => Ok(Some(stored)),
+            None => match &self.legacy_path {
+                Some(path) => Self::at(path.clone())
+                    .read_stored()
+                    .with_context(|| format!("cannot read legacy settings {}", path.display())),
+                None => Ok(None),
+            },
+        }
+    }
+
+    fn read_stored(&self) -> Result<Option<Stored>> {
+        let (parent, name) = self.location()?;
+        let directory = match open_directory(parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        validate_directory(&directory)?;
+        read_settings(&directory, &name)
     }
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
@@ -397,9 +423,14 @@ impl ConfigFile {
         let directory = open_directory(parent)?;
         validate_directory(&directory)?;
         // Never replace an unreadable, malformed, unsupported, or unsafe file.
-        let extra = read_settings(&directory, &name)?
-            .map(|stored| stored.extra)
-            .unwrap_or_default();
+        let existing = match read_settings(&directory, &name)? {
+            Some(stored) => Some(stored),
+            None => match &self.legacy_path {
+                Some(path) => Self::at(path.clone()).read_stored()?,
+                None => None,
+            },
+        };
+        let extra = existing.map(|stored| stored.extra).unwrap_or_default();
         let mut bytes = serde_json::to_vec_pretty(&StoredRef {
             settings,
             extra: &extra,
@@ -552,7 +583,7 @@ impl<'a> TemporaryFile<'a> {
     fn create(directory: &'a File) -> Result<(File, Self)> {
         for _ in 0..100 {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = CString::new(format!(".nettop-{}-{sequence}.tmp", std::process::id()))?;
+            let name = CString::new(format!(".nwtop-{}-{sequence}.tmp", std::process::id()))?;
             // SAFETY: name is a valid C string; O_EXCL reserves a new owned file.
             let descriptor = unsafe {
                 libc::openat(
@@ -608,7 +639,7 @@ mod tests {
         fn new() -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!(
-                "nettop-config-test-{}-{sequence}",
+                "nwtop-config-test-{}-{sequence}",
                 std::process::id()
             ));
             DirBuilder::new().mode(0o700).create(&path).unwrap();
@@ -616,7 +647,7 @@ mod tests {
         }
 
         fn config(&self) -> ConfigFile {
-            ConfigFile::at(self.0.join("nettop/config.json"))
+            ConfigFile::at(self.0.join("nwtop/config.json"))
         }
     }
 
@@ -624,6 +655,71 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn legacy_settings_migrate_on_save_with_unknown_keys_preserved() {
+        let directory = TestDirectory::new();
+        let legacy = ConfigFile::at(directory.0.join("nettop/config.json"));
+        legacy.save(&Settings::default()).unwrap();
+        let original = br#"{"bits":true,"future_option":{"kept":true}}"#;
+        fs::write(legacy.path(), original).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            legacy_path: Some(legacy.path.clone()),
+        };
+        let loaded = config.load_with_unknown_keys().unwrap();
+        assert!(loaded.settings.bits);
+        assert_eq!(loaded.unknown_keys, ["future_option"]);
+        assert!(!config.path().exists());
+        config.save(&loaded.settings).unwrap();
+        assert_eq!(config.load_with_unknown_keys().unwrap(), loaded);
+        assert_eq!(fs::read(legacy.path()).unwrap(), original);
+        assert_eq!(fs::metadata(config.path()).unwrap().mode() & 0o777, 0o600);
+        let saved: Value = serde_json::from_slice(&fs::read(config.path()).unwrap()).unwrap();
+        assert_eq!(saved["future_option"]["kept"], true);
+        // Once migrated, the new file wins even if the old one becomes invalid.
+        fs::write(legacy.path(), "invalid").unwrap();
+        assert_eq!(config.load_with_unknown_keys().unwrap(), loaded);
+        config.save(&loaded.settings).unwrap();
+    }
+
+    #[test]
+    fn malformed_primary_settings_do_not_fall_back_to_legacy() {
+        let directory = TestDirectory::new();
+        let legacy = ConfigFile::at(directory.0.join("nettop/config.json"));
+        legacy.save(&Settings::default()).unwrap();
+        let mut config = directory.config();
+        config.save(&Settings::default()).unwrap();
+        config.legacy_path = Some(legacy.path);
+        fs::write(config.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert_eq!(fs::read_to_string(config.path()).unwrap(), "invalid");
+    }
+
+    #[test]
+    fn invalid_or_symlinked_legacy_settings_do_not_migrate() {
+        let directory = TestDirectory::new();
+        let legacy = ConfigFile::at(directory.0.join("nettop/config.json"));
+        legacy.save(&Settings::default()).unwrap();
+        let config = ConfigFile {
+            path: directory.config().path,
+            legacy_path: Some(legacy.path.clone()),
+        };
+        fs::write(legacy.path(), "invalid").unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert!(!config.path().exists());
+        assert_eq!(fs::read_to_string(legacy.path()).unwrap(), "invalid");
+        fs::remove_file(legacy.path()).unwrap();
+        let target = directory.0.join("target.json");
+        fs::write(&target, "{}").unwrap();
+        symlink(&target, legacy.path()).unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        assert!(!config.path().exists());
+        assert_eq!(fs::read_to_string(target).unwrap(), "{}");
     }
 
     #[test]
@@ -789,7 +885,7 @@ mod tests {
     #[test]
     fn root_refuses_settings_below_another_users_directory() {
         let directory = TestDirectory::new();
-        let nested = directory.0.join("missing/nettop");
+        let nested = directory.0.join("missing/nwtop");
         // Ordinary users are never affected by the root-only refusal.
         assert!(refuse_foreign_directory_as_root(&nested, 1000).is_ok());
         let owner = fs::metadata(&directory.0).unwrap().uid();

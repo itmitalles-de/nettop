@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression: bytes of sockets that close well inside a long refresh interval.
 
-Run as root in the isolated container: python3 tests/short_lived.py /path/to/nettop
+Run as root in the isolated container: python3 tests/short_lived.py /path/to/nwtop
 """
 import json
 import multiprocessing as mp
@@ -70,7 +70,7 @@ def main():
     monitor = subprocess.Popen([binary, "--interface", "lo", "--json", "--interval", "20"],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     # Let pcap activation and the first attribution pass finish: sockets that
-    # open and close before nettop's first pass are a known startup gap.
+    # open and close before nwtop's first pass are a known startup gap.
     time.sleep(2.0)
     udp.start()
     for _ in range(CONNECTIONS):

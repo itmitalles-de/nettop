@@ -79,8 +79,8 @@ impl Lang {
 
     pub fn root_with_foreign_settings(self) -> String {
         self.pick(
-            "Save refused: nettop runs as root with another user's settings; start without sudo",
-            "Nicht gespeichert: nettop läuft als root mit fremden Einstellungen; ohne sudo starten",
+            "Save refused: nwtop runs as root with another user's settings; start without sudo",
+            "Nicht gespeichert: nwtop läuft als root mit fremden Einstellungen; ohne sudo starten",
         )
         .into()
     }

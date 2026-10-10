@@ -750,8 +750,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if area.width < 36 || area.height < 16 {
         frame.render_widget(
             Paragraph::new(app.lang().pick(
-                "nettop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
-                "nettop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
+                "nwtop\nTerminal too small.\nUse at least 36 x 16.\nq / F10 to quit.",
+                "nwtop\nTerminal zu klein.\nMindestens 36 x 16.\nq / F10 beendet.",
             ))
             .style(Style::default().fg(if app.settings.color {
                 KEY
@@ -1843,7 +1843,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "In all mode, virtual links can count forwarded traffic more than once.",
             "Command-line options and NO_COLOR apply only to this run.",
             "Enable process rates once: ./scripts/setup-capture.sh",
-            "After setup, start nettop without sudo.",
+            "After setup, start nwtop without sudo.",
             "",
         ],
         Lang::De => &[
@@ -1869,7 +1869,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Im Modus Alle können virtuelle Links Weitergeleitetes mehrfach zählen.",
             "Kommandozeilenoptionen und NO_COLOR gelten nur für diesen Lauf.",
             "Prozessraten einmalig aktivieren: ./scripts/setup-capture.sh",
-            "Danach nettop ohne sudo starten.",
+            "Danach nwtop ohne sudo starten.",
             "",
         ],
     };

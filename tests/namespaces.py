@@ -34,7 +34,7 @@ def in_namespace(namespace, *args, **kwargs):
 
 class Network:
     def __init__(self):
-        prefix = f"nettop-{os.getpid()}"
+        prefix = f"nwtop-{os.getpid()}"
         self.client, self.router, self.server = [prefix + suffix for suffix in ("-c", "-r", "-s")]
         self.created = []
         self.processes = []
@@ -113,7 +113,7 @@ class Network:
 
     def rules(self, protocol, mode):
         if self.has_rules:
-            in_namespace(self.router, "nft", "delete", "table", "ip", "nettop_test")
+            in_namespace(self.router, "nft", "delete", "table", "ip", "nwtop_test")
         dnat = f"{protocol} dport 18081 dnat to 198.18.101.2:18080;" if mode in ("dnat", "combined") else ""
         snat = "ip saddr 198.18.100.2 snat to 198.18.101.1;" if mode in ("snat", "combined") else ""
         if mode == "vlan-snat":
@@ -130,7 +130,7 @@ class Network:
         if mode == "hairpin":
             output = f"{protocol} dport 18081 dnat to 198.18.101.2:18080;"
             snat = "ip saddr 198.18.100.1 snat to 198.18.101.1;"
-        rules = f"""table ip nettop_test {{
+        rules = f"""table ip nwtop_test {{
  {tracking}
  chain pre {{
   type nat hook prerouting priority dstnat; policy accept;
@@ -243,7 +243,7 @@ def await_capture(process):
                 pass
         # The attribution worker is created only after pcap readiness and the
         # initial descriptor scan. BPF verification can exceed a fixed sleep.
-        if {"nettop-capture", "nettop-attrib"} <= names:
+        if {"nwtop-capture", "nwtop-attrib"} <= names:
             return
         time.sleep(.025)
     raise AssertionError("monitor did not finish capture startup")
@@ -361,7 +361,7 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
     network = Network()
     try:
-        with tempfile.TemporaryDirectory(prefix="nettop-ns-config-") as config:
+        with tempfile.TemporaryDirectory(prefix="nwtop-ns-config-") as config:
             environment = dict(os.environ, XDG_CONFIG_HOME=config)
             number = 0
             for case in args.case or CASES:

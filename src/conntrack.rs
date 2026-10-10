@@ -340,7 +340,7 @@ impl Conntrack {
         let thread_shared = shared.clone();
         let thread_stop = stop.clone();
         let worker = thread::Builder::new()
-            .name("nettop-conntrack".into())
+            .name("nwtop-conntrack".into())
             .spawn(move || {
                 let result = Socket::open().and_then(|socket| {
                     crate::privilege::retain_conntrack_privileges()?;

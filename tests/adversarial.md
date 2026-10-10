@@ -12,7 +12,7 @@ libpcap, Python 3, a C compiler, liburing development headers, nftables and
 conntrack. Run as guest root:
 
 ```sh
-python3 tests/adversarial.py target/release/nettop --isolated-vm --output /tmp/nettop-adversarial-results
+python3 tests/adversarial.py target/release/nwtop --isolated-vm --output /tmp/nwtop-adversarial-results
 ```
 
 Repeat with `--interface all` for the global socket-packet path. The default

@@ -3,7 +3,7 @@
 exits after the terminal is closed, and clean non-interactive output into a
 closed pipe.
 
-Run without root: python3 tests/terminal.py target/release/nettop
+Run without root: python3 tests/terminal.py target/release/nwtop
 Each case owns a fresh pseudo-terminal and affects no interactive terminal.
 """
 
@@ -215,7 +215,7 @@ def run_closed_pipe_case(binary):
 
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/terminal.py /path/to/nettop")
+        raise SystemExit("Usage: python3 tests/terminal.py /path/to/nwtop")
     binary = Path(sys.argv[1]).resolve(strict=True)
     for exit_signal in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_case(binary, exit_signal)

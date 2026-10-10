@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use nettop::{
+use nwtop::{
     collector::Collector,
     helper::{self, PROTOCOL_VERSION, Reply, Request},
     privilege,
@@ -15,7 +15,7 @@ use nettop::{
 fn serve() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     if arguments.len() != 1 || arguments[0] != "--stdio" {
-        bail!("this helper is launched by nettop; use nettop for the terminal interface");
+        bail!("this helper is launched by nwtop; use nwtop for the terminal interface");
     }
     privilege::require_helper_capabilities()?;
     // Disable core dumps that could retain transient captured bytes.

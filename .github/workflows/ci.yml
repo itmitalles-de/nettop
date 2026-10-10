@@ -72,24 +72,24 @@ jobs:
       - name: Build release
         run: cargo +stable build --release --locked
       - name: Test terminal restoration
-        run: python3 tests/terminal.py target/release/nettop
+        run: python3 tests/terminal.py target/release/nwtop
       - name: Test Setup and saved preferences
-        run: python3 tests/setup.py target/release/nettop
+        run: python3 tests/setup.py target/release/nwtop
       - name: Build isolated capture environment
-        run: docker build --tag nettop-test tests
+        run: docker build --tag nwtop-test tests
       - name: Test live TCP and UDP capture
         run: >-
           docker run --rm --network none --volume "$PWD:/work:ro"
-          nettop-test python3 tests/live_capture.py target/release/nettop
+          nwtop-test python3 tests/live_capture.py target/release/nwtop
       - name: Test attribution of sockets closed within one interval
         run: >-
           docker run --rm --network none --volume "$PWD:/work:ro"
-          nettop-test python3 tests/short_lived.py target/release/nettop
+          nwtop-test python3 tests/short_lived.py target/release/nwtop
       - name: Test unprivileged UI and capability helper
         run: >-
           docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE
-          --volume "$PWD:/work:ro" nettop-test
-          python3 tests/helper.py --isolated target/release/nettop target/release/nettop-collector
+          --volume "$PWD:/work:ro" nwtop-test
+          python3 tests/helper.py --isolated target/release/nwtop target/release/nwtop-collector
       - name: Check installer
         run: shellcheck scripts/*.sh
   audit:

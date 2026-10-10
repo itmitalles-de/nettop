@@ -16,7 +16,7 @@ helper falls back to direct unprivileged collection instead of exiting.
 UI colors use native ANSI colors and inverse styles, inheriting the terminal theme.
 `shutdown.rs` registers cooperative SIGINT/SIGTERM/SIGHUP handlers so raw mode,
 the alternate screen and the cursor are restored even with long refresh periods.
-`input.rs` reads crossterm events on a `nettop-input` thread, because crossterm's
+`input.rs` reads crossterm events on a `nwtop-input` thread, because crossterm's
 reader retries end-of-file/EIO from a hung-up terminal forever inside
 `event::poll`/`read`. The event loop waits on that channel in 100 ms steps and
 also exits (code 0, like SIGHUP) when stdin reports POLLHUP/POLLERR, which covers
@@ -24,13 +24,13 @@ closed terminals that send no SIGHUP to non-session-leaders. Final restore error
 are written without `eprintln!`, which would panic on a dead stderr.
 
 Normal-user capture uses the optional root-owned, group-restricted
-`/usr/local/libexec/nettop-collector`, which clears its whole environment before
+`/usr/local/libexec/nwtop-collector`, which clears its whole environment before
 loading libpcap, because libibverbs honors driver variables via plain getenv. `helper.rs` provides a versioned, bounded
 stdio protocol; replies have a deadline and cancellation so a stalled helper
 cannot trap the UI. `privilege.rs` drops per-thread capabilities: the capture
 worker keeps none after opening pcap; the sampling thread keeps only
 DAC_READ_SEARCH and SYS_PTRACE for process descriptors, as does the
-`nettop-attrib` thread it starts. All set NO_NEW_PRIVS.
+`nwtop-attrib` thread it starts. All set NO_NEW_PRIVS.
 `scripts/setup-capture.sh` builds unprivileged, authenticates only for root-owned
 installation, copies the build into a root-only file (no final symlink), verifies
 that copy's digest before granting group access and capabilities, and refuses
@@ -48,7 +48,7 @@ Interface indexes come from `if_nametoindex`/AF_PACKET entries, never a 0
 fallback; IPv4 alias labels (`eth0:1`) map to their device, so VIPs are local.
 Interface rates are monotonic counter deltas divided by the measured interval.
 Device removal preserves the UI and permits selection of another device.
-With capture, a background `nettop-attrib` thread, started from the sampling
+With capture, a background `nwtop-attrib` thread, started from the sampling
 thread on the first snapshot (so it inherits exactly that thread's
 capabilities), refreshes sockets and attributes captured flows every 250–500 ms,
 independent of the UI interval; snapshots only add the final pass and divide

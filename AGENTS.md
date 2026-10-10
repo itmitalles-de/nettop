@@ -1,4 +1,4 @@
-# nettop
+# nwtop
 
 Follow `/home/tim/AGENTS.md` when working on the owner's machine.
 

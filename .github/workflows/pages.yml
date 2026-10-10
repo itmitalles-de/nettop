@@ -60,11 +60,11 @@ jobs:
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 180 \
             --connect-timeout 10 --max-time 25 \
-            https://nettop.wutz.io/ -o "$RUNNER_TEMP/nettop-index.html"
+            https://nettop.wutz.io/ -o "$RUNNER_TEMP/nwtop-index.html"
           python3 - <<'PY'
           import os
           from pathlib import Path
-          html = (Path(os.environ["RUNNER_TEMP"]) / "nettop-index.html").read_text()
-          assert '<title>nettop — your network, in view</title>' in html
+          html = (Path(os.environ["RUNNER_TEMP"]) / "nwtop-index.html").read_text()
+          assert '<title>nwtop — your network, in view</title>' in html
           assert 'assets/nettop-demo.mp4' in html
           PY

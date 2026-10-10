@@ -4,8 +4,8 @@
 # runs this user-writable script and installs the binary the user built.
 set -euo pipefail
 
-destination=/usr/local/libexec/nettop-collector
-receipt=/usr/local/libexec/.nettop-collector.sha256
+destination=/usr/local/libexec/nwtop-collector
+receipt=/usr/local/libexec/.nwtop-collector.sha256
 capabilities=cap_dac_read_search,cap_net_raw,cap_sys_ptrace=ep
 staged_binary=''
 staged_receipt=''
@@ -131,8 +131,8 @@ if [[ "${1:-}" == --install ]]; then
     safe_directory /usr/local/libexec
     check_destination
     check_group "$owner_uid" "$owner_gid" "$allow_shared" "$reassign"
-    staged_binary="$(mktemp /usr/local/libexec/.nettop-collector.XXXXXX)"
-    staged_receipt="$(mktemp /usr/local/libexec/.nettop-collector-receipt.XXXXXX)"
+    staged_binary="$(mktemp /usr/local/libexec/.nwtop-collector.XXXXXX)"
+    staged_receipt="$(mktemp /usr/local/libexec/.nwtop-collector-receipt.XXXXXX)"
     # Copy once into a root-only file without following a final symlink, then
     # verify exactly those bytes before any group may read or execute them.
     chmod 700 -- "$staged_binary"
@@ -153,7 +153,7 @@ if [[ "${1:-}" == --install ]]; then
     staged_receipt=''
     printf 'Installed root-owned capture helper for primary group %s.\n' "$owner_gid"
     getcap "$destination"
-    printf 'Start normally: nettop\n'
+    printf 'Start normally: nwtop\n'
     exit 0
 fi
 
@@ -175,10 +175,10 @@ check_group "$(id -u)" "$(id -g)" "$allow_shared" "$reassign"
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_options=()
 if (( extended )); then
-    bpf_clang="${NETTOP_BPF_CLANG:-clang}"
+    bpf_clang="${NWTOP_BPF_CLANG:-clang}"
     if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
         ! "$bpf_clang" --print-targets 2>/dev/null | grep -q 'bpfel'; then
-        fail 'Extended attribution requires clang with the bpfel target; install clang or set NETTOP_BPF_CLANG.'
+        fail 'Extended attribution requires clang with the bpfel target; install clang or set NWTOP_BPF_CLANG.'
     fi
     if ! "$bpf_clang" -E -x c - >/dev/null 2>&1 <<'HEADERS'
 #include <linux/types.h>
@@ -191,8 +191,8 @@ HEADERS
     fi
     build_options=(--features ebpf)
 fi
-cargo build --release --locked "${build_options[@]}" --bin nettop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
-binary="$repo_dir/target/release/nettop-collector"
+cargo build --release --locked "${build_options[@]}" --bin nwtop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+binary="$repo_dir/target/release/nwtop-collector"
 read -r digest _ < <(sha256sum -- "$binary")
 printf 'One-time setup: install %s with capture and /proc read capabilities.\n' "$destination"
 if (( extended )); then

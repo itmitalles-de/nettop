@@ -18,7 +18,7 @@ from extended import wait_capture
 
 
 def run(args, count, scope):
-    with tempfile.TemporaryDirectory(prefix="nettop-pressure-") as config:
+    with tempfile.TemporaryDirectory(prefix="nwtop-pressure-") as config:
         monitor = subprocess.Popen(
             [str(args.binary), "--json", "--interface", scope, "--interval", "8"],
             env=dict(os.environ, XDG_CONFIG_HOME=config, LANG="C"),

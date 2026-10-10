@@ -206,7 +206,7 @@ impl Worker {
             .unwrap_or_default();
         let thread_wake = Arc::clone(&wake);
         let handle = thread::Builder::new()
-            .name("nettop-attrib".to_string())
+            .name("nwtop-attrib".to_string())
             .spawn(move || {
                 let mut wait = ATTRIBUTION_TICK;
                 let mut topology = TopologyCache::default();
@@ -1781,7 +1781,7 @@ mod tests {
     fn vanished_interface_is_empty_and_preserves_other_kernel_devices() {
         let mut collector = Collector::new(false).unwrap();
         let snapshot = collector
-            .sample(Some("nettop-test-interface-does-not-exist"))
+            .sample(Some("nwtop-test-interface-does-not-exist"))
             .unwrap();
         assert!(!snapshot.interfaces.is_empty());
         assert!(snapshot.processes.is_empty());
@@ -1845,7 +1845,7 @@ mod tests {
         let link = &addresses[&loopback];
         assert!(link.loopback);
         assert!(link.addresses.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(interface_index("nettop-test-interface-does-not-exist").is_none());
+        assert!(interface_index("nwtop-test-interface-does-not-exist").is_none());
         assert!(
             local_interfaces(&mut TopologyCache::default())
                 .iter()

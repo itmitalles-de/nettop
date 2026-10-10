@@ -2,28 +2,28 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=bpf/lifecycle.bpf.c");
-    println!("cargo:rerun-if-env-changed=NETTOP_BPF_CLANG");
+    println!("cargo:rerun-if-env-changed=NWTOP_BPF_CLANG");
     if env::var_os("CARGO_FEATURE_EBPF").is_none() {
         return;
     }
     let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("x86_64") => "x86",
         Ok("aarch64") => "arm64",
-        other => panic!("nettop ebpf supports only Linux x86_64/aarch64 targets, got {other:?}"),
+        other => panic!("nwtop ebpf supports only Linux x86_64/aarch64 targets, got {other:?}"),
     };
     assert_eq!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
         Ok("linux"),
-        "nettop ebpf requires Linux"
+        "nwtop ebpf requires Linux"
     );
     assert_eq!(
         env::var("CARGO_CFG_TARGET_ENDIAN").as_deref(),
         Ok("little"),
-        "nettop ebpf currently requires little-endian x86_64/aarch64"
+        "nwtop ebpf currently requires little-endian x86_64/aarch64"
     );
     let output =
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR")).join("lifecycle.bpf.o");
-    let compiler = env::var_os("NETTOP_BPF_CLANG").unwrap_or_else(|| "clang".into());
+    let compiler = env::var_os("NWTOP_BPF_CLANG").unwrap_or_else(|| "clang".into());
     let mut command = Command::new(&compiler);
     command.args([
         "-target",

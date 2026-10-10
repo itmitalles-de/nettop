@@ -1,12 +1,12 @@
 [package]
-name = "nettop"
+name = "nwtop"
 version = "0.1.0"
 edition = "2024"
-default-run = "nettop"
+default-run = "nwtop"
 rust-version = "1.88"
 description = "An nvtop-inspired Linux network monitor with live graphs and per-process traffic"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/itmitalles-de/nettop"
+repository = "https://github.com/itmitalles-de/nwtop"
 
 [features]
 default = []
@@ -24,12 +24,12 @@ serde_json = "1.0"
 signal-hook = "0.3"
 
 [[bin]]
-name = "nettop"
+name = "nwtop"
 path = "src/main.rs"
 
 [[bin]]
-name = "nettop-collector"
-path = "src/bin/nettop-collector.rs"
+name = "nwtop-collector"
+path = "src/bin/nwtop-collector.rs"
 
 [profile.release]
 lto = "thin"

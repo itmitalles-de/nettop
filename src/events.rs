@@ -540,7 +540,7 @@ mod enabled {
             let thread_stop = Arc::clone(&stop);
             let (ready, receiver) = mpsc::sync_channel(1);
             let worker = thread::Builder::new()
-                .name("nettop-events".to_string())
+                .name("nwtop-events".to_string())
                 .spawn(move || {
                     let mut session = match Session::open() {
                         Ok(session) => session,
