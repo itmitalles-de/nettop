@@ -5,12 +5,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use nettop::{
     collector::{Collector, default_interface},
     config::{ConfigFile, RootWithForeignSettings, Settings},
     helper::Client,
     i18n::Lang,
+    input::{self, Events, Input},
     model::Snapshot,
     shutdown::SignalGuard,
     ui::{self, Action, App},
@@ -302,15 +303,39 @@ fn main() -> Result<()> {
     // Setup can also reset previously colored cells and override NO_COLOR.
     crossterm::style::force_color_output(true);
     let mut terminal = ratatui::init();
-    let result = run(
-        &mut terminal,
-        &mut source,
-        &mut app,
-        config.as_ref(),
-        &shutdown,
-    );
-    ratatui::restore();
-    if shutdown.requested() { Ok(()) } else { result }
+    let result = Events::start()
+        .context("starting terminal input")
+        .and_then(|events| {
+            run(
+                &mut terminal,
+                &mut source,
+                &mut app,
+                config.as_ref(),
+                &shutdown,
+                &events,
+            )
+        });
+    let restored = ratatui::try_restore();
+    let cursor = terminal.show_cursor();
+    // ratatui reports restore and cursor errors (the latter when dropping the
+    // terminal) with `eprintln!`, which panics on a closed terminal's stderr
+    // and then aborts in ratatui's panic hook. Report them below instead.
+    std::mem::forget(terminal);
+    // A closed terminal ends the monitor like SIGHUP, which the kernel sends
+    // only to a session leader. Output can fail just before the hang-up is
+    // visible on input, so a failed run waits briefly for it.
+    let grace = if result.is_err() {
+        Duration::from_millis(100)
+    } else {
+        Duration::ZERO
+    };
+    if shutdown.requested() || input::terminal_hung_up(grace) {
+        return Ok(());
+    }
+    if let Err(error) = restored.and(cursor) {
+        let _ = writeln!(io::stderr(), "Failed to restore terminal: {error}");
+    }
+    result
 }
 
 /// A reader that exits early, as in `nettop --json | head`, is not an error.
@@ -372,29 +397,33 @@ fn run(
     app: &mut App,
     config: Option<&ConfigFile>,
     shutdown: &SignalGuard,
+    events: &Events,
 ) -> Result<()> {
     let mut next_sample = Instant::now() + Duration::from_millis(app.settings.interval_ms);
     'running: loop {
-        if shutdown.requested() {
+        if shutdown.requested() || input::terminal_hung_up(Duration::ZERO) {
             break;
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
-        // Poll frequently for external termination without repainting between
-        // events or samples. Even a 60-second interval exits promptly.
-        let event_ready = loop {
-            if shutdown.requested() {
+        // Check frequently for external termination and terminal hang-up
+        // without repainting between events or samples. Even a 60-second
+        // interval exits promptly.
+        let event = loop {
+            if shutdown.requested() || input::terminal_hung_up(Duration::ZERO) {
                 break 'running;
             }
             let remaining = next_sample.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break false;
+                break None;
             }
-            if event::poll(remaining.min(Duration::from_millis(100)))? {
-                break true;
+            match events.next(remaining.min(Duration::from_millis(100))) {
+                Input::Event(event) => break Some(event),
+                Input::Timeout => {}
+                Input::Failed(error) => return Err(error).context("reading terminal input"),
             }
         };
-        if event_ready {
-            match event::read()? {
+        if let Some(event) = event {
+            match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match app.handle_key(key) {
                     Action::Quit => break,
                     Action::InterfaceChanged => {

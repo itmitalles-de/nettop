@@ -279,6 +279,59 @@ def check_stopped_helper(binary, account, signal_exit=True):
         os.close(slave)
 
 
+def controlling_terminal():
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def check_terminal_hangup(binary, account, controlling=False):
+    """A closed terminal ends the UI promptly and stops and reaps the helper.
+
+    Without a controlling terminal no SIGHUP arrives; the UI must notice the
+    hang-up itself instead of spinning on end-of-file input.
+    """
+    master, slave = pty.openpty()
+    output = bytearray()
+    monitor = None
+    helper_pid = None
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
+        monitor = subprocess.Popen(
+            [str(binary), "--interface", "lo", "--interval", "60"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env={**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8"},
+            start_new_session=True,
+            preexec_fn=controlling_terminal if controlling else None,
+            **unprivileged(account),
+        )
+        deadline = time.monotonic() + 5
+        while b"Device" not in output or b"\x1b[?1049h" not in output:
+            assert monitor.poll() is None, f"PTY monitor exited: {output!r}"
+            assert time.monotonic() < deadline, f"PTY monitor did not draw: {output!r}"
+            read_terminal(master, output, 0.05)
+        helper_pid = check_capabilities(monitor, account)
+        os.close(master)
+        master = None
+        try:
+            monitor.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("UI kept running after its terminal closed") from None
+        assert monitor.returncode == 0, f"Unexpected exit code: {monitor.returncode}"
+        assert not Path(f"/proc/{helper_pid}").exists(), "Helper survived the terminal hang-up"
+        kind = "controlling terminal" if controlling else "terminal without SIGHUP"
+        print(f"PASS closed {kind} ends the UI within two seconds and reaps the helper")
+    finally:
+        if helper_pid is not None and Path(f"/proc/{helper_pid}").exists():
+            os.kill(helper_pid, signal.SIGKILL)
+        if monitor is not None and monitor.poll() is None:
+            monitor.kill()
+            monitor.wait(timeout=3)
+        for descriptor in (master, slave):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
 def packet_inodes():
     return {line.split()[-1] for line in Path("/proc/net/packet").read_text().splitlines()[1:]}
 
@@ -440,6 +493,8 @@ def main():
                 check_protocol(account)
                 check_stopped_helper(binary, account)
                 check_stopped_helper(binary, account, signal_exit=False)
+                check_terminal_hangup(binary, account)
+                check_terminal_hangup(binary, account, controlling=True)
                 check_abrupt_exit(binary, account)
     finally:
         # These paths were absent before this explicitly isolated test started.
