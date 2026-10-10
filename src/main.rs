@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
-use nettop::{
+use nwtop::{
     collector::{Collector, default_interface},
     config::{ConfigFile, RootWithForeignSettings, Settings},
     helper::Client,
@@ -372,7 +372,7 @@ fn startup_sample(
     }
 }
 
-/// A reader that exits early, as in `nettop --json | head`, is not an error.
+/// A reader that exits early, as in `nwtop --json | head`, is not an error.
 fn ignore_closed_output(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -509,7 +509,7 @@ fn print_snapshot(
     let (rx, tx, _, _) = ui::totals(snapshot, interface);
     writeln!(
         out,
-        "nettop{}  {}",
+        "nwtop{}  {}",
         if demo { " DEMO" } else { "" },
         interface.unwrap_or("all interfaces")
     )?;
@@ -569,7 +569,7 @@ mod tests {
             ..Settings::default()
         };
         let args = Args::parse_from([
-            "nettop",
+            "nwtop",
             "--bits",
             "--interval",
             "0.1",
@@ -622,7 +622,7 @@ mod tests {
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .starts_with("nettop DEMO  enp112s0")
+                .starts_with("nwtop DEMO  enp112s0")
         );
     }
 

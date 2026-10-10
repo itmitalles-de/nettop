@@ -1,5 +1,24 @@
 # Verified state
 
+## Rename to nwtop (2026-10-10)
+
+- The project is now public `itmitalles-de/nwtop` (GPL-3.0-or-later).
+  Executables: `nwtop` and `/usr/local/libexec/nwtop-collector`; build overrides
+  use the `NWTOP_` prefix. GitHub redirects old repository links.
+- Existing nettop preferences are read only when the nwtop configuration is
+  absent; saving writes `nwtop/config.json` and preserves the legacy file.
+- The public website retains `https://nettop.wutz.io` pending a separately
+  configured replacement DNS hostname; visible branding and commands use nwtop.
+- Verified rename: 144 default and 153 extended Rust tests, Clippy both modes,
+  terminal restoration and real F12 legacy migration, shell syntax/ShellCheck.
+  Installed extended UI/helper hashes match the build; `nwtop --once` and JSON
+  All capture succeeded without drops. Verified old executables were removed.
+  UI SHA-256: `49a14bd103a57c873a70a68727c0c81e4bc9cbb6124c472082788e943b0af7b6`;
+  helper: `9339fc8ad1c090e656139ccaa47db855c94b086b02ad4296436e7928d2dfd0ea`.
+  Website before/after review: `../nettop-review/rename-nwtop/review.html`.
+- Historical evidence paths and pre-rename installation hashes below describe
+  the original nettop validation and are retained unchanged.
+
 ## Optional attribution completion (2026-10-10)
 
 - Current implementation: `b5f3b56`, [PR #15](https://github.com/itmitalles-de/nettop/pull/15),

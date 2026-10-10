@@ -447,7 +447,7 @@ impl Capture {
         let thread_wake = Arc::clone(&wake);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
-            .name("nettop-capture".to_string())
+            .name("nwtop-capture".to_string())
             .spawn(move || {
                 let mut clock = TimestampClock::new();
                 let session = match Session::open() {

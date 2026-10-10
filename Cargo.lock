@@ -475,7 +475,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nettop"
+name = "nwtop"
 version = "0.1.0"
 dependencies = [
  "anyhow",

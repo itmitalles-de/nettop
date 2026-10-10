@@ -3,7 +3,7 @@
 `cargo build --features ebpf` compiles `lifecycle.bpf.c` with clang's BPF backend
 and libbpf development headers. The default build needs neither tool. The
 result is embedded in the Rust binary; the runtime loader uses `libbpf.so.1`
-and never accepts an external BPF object. `NETTOP_BPF_CLANG` can name an explicit
+and never accepts an external BPF object. `NWTOP_BPF_CLANG` can name an explicit
 compiler executable. Linux little-endian x86_64 and aarch64 builds are supported;
 actual kernel validation currently covers x86_64 Linux 6.8.
 

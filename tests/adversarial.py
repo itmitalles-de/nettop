@@ -18,7 +18,7 @@ import time
 class Monitor:
     def __init__(self, binary, name, output, interval=4, interface="lo", readiness_delay=0):
         self.name, self.output, self.stopped = name, output, False
-        self.config = tempfile.TemporaryDirectory(prefix="nettop-adversarial-")
+        self.config = tempfile.TemporaryDirectory(prefix="nwtop-adversarial-")
         self.process = subprocess.Popen(
             [str(binary), "--json", "--interval", str(interval), "--interface", interface],
             env=dict(os.environ, XDG_CONFIG_HOME=self.config.name, LANG="C"),
@@ -358,7 +358,7 @@ def conntrack_case(args):
 
 
 def uring_case(args):
-    with tempfile.TemporaryDirectory(prefix="nettop-uring-") as directory:
+    with tempfile.TemporaryDirectory(prefix="nwtop-uring-") as directory:
         helper = Path(directory) / "uring"
         subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", str(Path(__file__).with_name("adversarial-uring.c")),
                         "-luring", "-o", str(helper)], check=True)
@@ -488,7 +488,7 @@ def closed_sender(destination, channel, release):
 
 
 def retransmit_case(args):
-    table = "nettop_adversarial_" + str(os.getpid())
+    table = "nwtop_adversarial_" + str(os.getpid())
     created = False
     release = mp.Event()
     worker = None
@@ -563,7 +563,7 @@ CASES = {"fork": fork_case, "scm-rights": passed_case, "reuseport-unread": reuse
 def conntrack_fixture():
     # A fresh guest without a firewall may not register any conntrack hooks.
     # Read-only state counters activate tracking; they accept every packet.
-    table = "nettop_adversarial_ct_" + str(os.getpid())
+    table = "nwtop_adversarial_ct_" + str(os.getpid())
     rules = (f"add table inet {table}\n"
              f"add chain inet {table} prerouting {{ type filter hook prerouting priority -150; policy accept; }}\n"
              f"add chain inet {table} output {{ type filter hook output priority -150; policy accept; }}\n"

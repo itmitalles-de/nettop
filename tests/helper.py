@@ -5,7 +5,7 @@ Run only in an isolated container/runner as root, with NET_RAW, DAC_READ_SEARCH,
 SYS_PTRACE and SETFCAP in its capability bounding set. This test installs at the
 real helper path and refuses to replace a pre-existing installation. Example:
 
-  python3 tests/helper.py --isolated target/release/nettop target/release/nettop-collector
+  python3 tests/helper.py --isolated target/release/nwtop target/release/nwtop-collector
 
 The UI itself runs as nobody with no supplementary groups or capabilities.
 Traffic stays on loopback; every process and installed file is test-owned.
@@ -33,8 +33,8 @@ import time
 from unittest.mock import patch
 
 
-HELPER = Path("/usr/local/libexec/nettop-collector")
-RECEIPT = HELPER.with_name(".nettop-collector.sha256")
+HELPER = Path("/usr/local/libexec/nwtop-collector")
+RECEIPT = HELPER.with_name(".nwtop-collector.sha256")
 READ_CAPS = (1 << 2) | (1 << 19)
 HELPER_CAPS = READ_CAPS | (1 << 13)
 FILE_CAPS = "cap_dac_read_search,cap_net_raw,cap_sys_ptrace=ep"
@@ -81,7 +81,7 @@ def check_capabilities(monitor, account):
         # The main sampling thread and the background socket attribution
         # thread read /proc; the capture worker keeps no capabilities.
         comm = Path(f"/proc/{helper_pid}/task/{task.name}/comm").read_text().strip()
-        expected = READ_CAPS if int(task.name) == helper_pid or comm == "nettop-attrib" else 0
+        expected = READ_CAPS if int(task.name) == helper_pid or comm == "nwtop-attrib" else 0
         assert all(int(value) == account.pw_uid for value in state["Uid"].split()), "Helper changed UID"
         assert int(state["CapEff"], 16) == expected, f"Wrong effective capabilities: {state['CapEff']}"
         assert int(state["CapPrm"], 16) == expected, f"Wrong permitted capabilities: {state['CapPrm']}"
@@ -473,7 +473,7 @@ def check_installer(script, build, account):
 
 def check_installer_groups(install, build, account):
     """Shared primary groups and silent group takeover need explicit flags."""
-    private, other, listed = "nettop-test-private", "nettop-test-other", "nettop-test-listed"
+    private, other, listed = "nwtop-test-private", "nwtop-test-other", "nwtop-test-listed"
     nologin = ["--no-create-home", "--shell", "/usr/sbin/nologin"]
     subprocess.run(["useradd", "--user-group", *nologin, private], check=True)
     try:
@@ -520,11 +520,11 @@ def main():
     account = pwd.getpwnam("nobody")
     assert account.pw_uid != 0 and account.pw_gid != 0
     try:
-        with tempfile.TemporaryDirectory(prefix="nettop-helper-test-") as directory:
+        with tempfile.TemporaryDirectory(prefix="nwtop-helper-test-") as directory:
             # Source ownership is checked by the real installer; allow nobody to
             # traverse the test staging directory without making it writable.
             os.chmod(directory, 0o755)
-            build = Path(directory) / "nettop-collector"
+            build = Path(directory) / "nwtop-collector"
             shutil.copy2(helper_binary, build)
             os.chown(build, account.pw_uid, account.pw_gid)
             # Popen(user=...) changes credentials but inherits root's environment.

@@ -3,14 +3,14 @@
 Run these tests only inside a dedicated QEMU/KVM guest. A privileged Docker
 container shares the host kernel and is not sufficient isolation for global BPF
 tracing. The script verifies both the explicit `--isolated-vm` argument and the
-virtualization type before launching nettop.
+virtualization type before launching nwtop.
 
-Build nettop with `cargo build --release --features ebpf`; the build requires
+Build nwtop with `cargo build --release --features ebpf`; the build requires
 clang with a BPF backend and libbpf development headers. The guest needs BTF,
 libbpf.so.1, libpcap, Python 3 and iproute2. As guest root:
 
 ```sh
-python3 tests/extended.py --isolated-vm target/release/nettop
+python3 tests/extended.py --isolated-vm target/release/nwtop
 ```
 
 `--case tcp4|tcp6|udp4|udp6|exited|burst` selects an individual case. Every socket
@@ -53,7 +53,7 @@ unsupported kernels, or every namespace/NAT topology; those need separate tests.
 Inside the same isolated guest, install nftables and run:
 
 ```sh
-python3 tests/namespaces.py --isolated-vm target/release/nettop
+python3 tests/namespaces.py --isolated-vm target/release/nwtop
 ```
 
 The harness owns three temporary network namespaces (client/router/server),

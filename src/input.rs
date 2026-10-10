@@ -34,7 +34,7 @@ impl Events {
     pub fn start() -> io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(256);
         thread::Builder::new()
-            .name("nettop-input".into())
+            .name("nwtop-input".into())
             .spawn(move || {
                 loop {
                     let event = event::read();

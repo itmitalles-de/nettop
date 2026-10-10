@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://nettop.wutz.io">
-    <img src="site/assets/readme-banner.svg" alt="nettop — your network, in view" width="100%">
+    <img src="site/assets/readme-banner.svg" alt="nwtop — your network, in view" width="100%">
   </a>
 </p>
 
@@ -19,10 +19,10 @@
   <a href="https://nettop.wutz.io">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#keyboard">Keyboard</a> ·
-  <a href="https://github.com/itmitalles-de/nettop">Source</a>
+  <a href="https://github.com/itmitalles-de/nwtop">Source</a>
 </p>
 
-**nettop** puts interface traffic, process activity, and individual connections
+**nwtop** (formerly nettop) puts interface traffic, process activity, and individual connections
 in one compact view. Green for receive, yellow for send, stepped history graphs,
 and your terminal's own ANSI palette. The layout works in a split terminal,
 including 36 × 16 and 52 × 18.
@@ -32,7 +32,7 @@ regular user; a separate helper provides the access needed for process traffic.
 Interface counters also work without that setup.
 
 <p align="center">
-  <img src="site/assets/nettop-demo.png" alt="nettop terminal showing receive and send graphs above a process traffic table, with F2 Setup and F12 Save in the function-key bar" width="100%">
+  <img src="site/assets/nettop-demo.png" alt="nwtop terminal showing receive and send graphs above a process traffic table, with F2 Setup and F12 Save in the function-key bar" width="100%">
   <br>
   <sub>Actual terminal output in explicit DEMO mode. The displayed traffic is synthetic.</sub>
 </p>
@@ -55,22 +55,22 @@ GitHub account.
 # Ubuntu 24.04 and newer: capture runtime and capability tools.
 sudo apt install libpcap0.8t64 libcap2-bin
 
-git clone https://github.com/itmitalles-de/nettop.git
-cd nettop
+git clone https://github.com/itmitalles-de/nwtop.git
+cd nwtop
 ./scripts/install.sh
 ./scripts/setup-capture.sh       # One-time administrator authentication.
-~/.local/bin/nettop
+~/.local/bin/nwtop
 ```
 
 The installer builds from source and installs the UI into `~/.local/bin` as your
 regular user. Add that directory to your `PATH`, then start with:
 
 ```bash
-nettop
+nwtop
 ```
 
 Older Debian/Ubuntu versions call the runtime package `libpcap0.8`. Without
-libpcap or capture setup, use `nettop --no-capture` for interface counters and
+libpcap or capture setup, use `nwtop --no-capture` for interface counters and
 accessible socket lists. Unavailable process rates appear as `-`.
 
 <details>
@@ -82,7 +82,7 @@ symlinks, and modified executables are preserved.
 
 `scripts/setup-capture.sh` also builds as your regular user. It requests
 administrator authentication through `pkexec`, or `sudo` when `pkexec` is not
-installed, only for installing `/usr/local/libexec/nettop-collector`. Start both
+installed, only for installing `/usr/local/libexec/nwtop-collector`. Start both
 scripts without sudo. The package installation command above is separate from
 this user-local build. **The administrator who authenticates trusts your
 checkout:** the root phase runs this user-writable script and installs the binary
@@ -110,11 +110,12 @@ The UI has no capabilities. It starts the fixed helper over private stdin/stdout
 pipes: no background service, listening port, or arbitrary file/command API.
 Responses are bounded and interruptible, and the helper ends with its UI.
 Containers and sandboxes can prevent capability acquisition even after setup;
-nettop reports this instead of inventing traffic measurements.
+nwtop reports this instead of inventing traffic measurements.
 
 `--no-capture` explicitly bypasses the helper. An administrator can revoke access
-by removing `/usr/local/libexec/nettop-collector` and its receipt,
-`/usr/local/libexec/.nettop-collector.sha256`.
+by removing `/usr/local/libexec/nwtop-collector` and its receipt,
+`/usr/local/libexec/.nwtop-collector.sha256`. If upgrading from nettop, also
+remove the legacy helper and receipt listed below to revoke its access.
 
 </details>
 
@@ -143,7 +144,7 @@ The extended helper additionally receives `CAP_BPF`, `CAP_PERFMON` and
 `CAP_NET_ADMIN`. Its BPF worker drops all capabilities after attaching; its
 conntrack worker retains only `CAP_NET_ADMIN` for subsequent netlink queries.
 The UI stays unprivileged. No permanent service or pinned BPF objects are created;
-closing nettop releases its probes. Run both installer scripts again without
+closing nwtop releases its probes. Run both installer scripts again without
 `--extended-attribution` to return to the standard build and capability set.
 
 Captured IP packets remain the only source of process byte counts. Event data
@@ -175,7 +176,7 @@ that view; an absent mapping never proves absence of NAT. Identical packet
 headers are not used to guess a socket across namespaces. Foreign loopback does
 not appear under the host's loopback interface. Interface graphs always use the
 host kernel counters, so their scope differs from cross-namespace process totals.
-nettop neither enters namespaces nor changes firewall rules.
+nwtop neither enters namespaces nor changes firewall rules.
 
 All packet hooks attach together or startup retains the existing capture path
 with an explanation. A fatal runtime packet-backend failure makes All process
@@ -187,16 +188,16 @@ any proven endpoint while ending the wait for remaining evidence.
 ## Use
 
 ```bash
-nettop --interface eth0          # Select a network interface.
-nettop --interface all           # Include virtual interfaces in the aggregate.
-nettop --interval 0.5 --history 90
-nettop --bits                    # Display rates in bits per second.
-nettop --bytes                   # Override saved bit/s units.
-nettop --no-color                # Start in monochrome.
-nettop --no-capture              # Interface counters and accessible sockets.
-nettop --once                    # Print one measured snapshot and exit.
-nettop --json                    # Print a JSON snapshot and exit.
-nettop --demo                    # Clearly labeled synthetic UI preview.
+nwtop --interface eth0          # Select a network interface.
+nwtop --interface all           # Include virtual interfaces in the aggregate.
+nwtop --interval 0.5 --history 90
+nwtop --bits                    # Display rates in bits per second.
+nwtop --bytes                   # Override saved bit/s units.
+nwtop --no-color                # Start in monochrome.
+nwtop --no-capture              # Interface counters and accessible sockets.
+nwtop --once                    # Print one measured snapshot and exit.
+nwtop --json                    # Print a JSON snapshot and exit.
+nwtop --demo                    # Clearly labeled synthetic UI preview.
 ```
 
 The default refresh interval is **1 second**; `--interval` / `-d` accepts
@@ -247,7 +248,7 @@ Exiting without F12 keeps changes only for the current session.
 <summary><strong>Settings file and command-line overrides</strong></summary>
 
 Settings are saved atomically with private file permissions to
-`$XDG_CONFIG_HOME/nettop/config.json`, or `~/.config/nettop/config.json` when
+`$XDG_CONFIG_HOME/nwtop/config.json`, or `~/.config/nwtop/config.json` when
 `XDG_CONFIG_HOME` is unset, empty, or relative.
 
 Explicit CLI options override saved preferences for that run only. `--no-color`
@@ -258,8 +259,8 @@ are saved only when you change that setting yourself.
 Malformed or unsupported settings produce a warning and use defaults. Saving
 preserves the original file until it is fixed or moved aside. Unknown keys, such
 as typos, produce a warning and are kept when saving. If a saved interface no
-longer exists, nettop warns and selects an interface automatically for that run;
-the saved choice remains until you choose another one. Run nettop without sudo:
+longer exists, nwtop warns and selects an interface automatically for that run;
+the saved choice remains until you choose another one. Run nwtop without sudo:
 as root it refuses to save into another user's settings directory.
 
 </details>
@@ -296,14 +297,14 @@ data. Interface totals and process totals can differ.
   broadcast receiver membership is not inferred from ports. IPv6 wildcard
   sockets are matched to IPv4 only when Linux socket diagnostics confirm
   dual-stack operation.
-- Packet headers are interpreted; payloads are not logged. nettop does not
+- Packet headers are interpreted; payloads are not logged. nwtop does not
   perform DNS lookups.
 
 </details>
 
 ## Development
 
-nettop is written in Rust. Build and run the core checks with:
+nwtop is written in Rust. Build and run the core checks with:
 
 ```bash
 cargo fmt --check
@@ -311,8 +312,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 shellcheck scripts/*.sh
-python3 tests/terminal.py target/release/nettop
-python3 tests/setup.py target/release/nettop
+python3 tests/terminal.py target/release/nwtop
+python3 tests/setup.py target/release/nwtop
 ```
 
 <details>
@@ -323,12 +324,12 @@ use a read-only repository mount and a separate network namespace with no
 external connectivity:
 
 ```bash
-docker build -t nettop-test tests
-docker run --rm --network none -v "$PWD:/work:ro" nettop-test \
-  python3 tests/live_capture.py target/release/nettop
+docker build -t nwtop-test tests
+docker run --rm --network none -v "$PWD:/work:ro" nwtop-test \
+  python3 tests/live_capture.py target/release/nwtop
 docker run --rm --network none --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE \
-  -v "$PWD:/work:ro" nettop-test python3 tests/helper.py --isolated \
-  target/release/nettop target/release/nettop-collector
+  -v "$PWD:/work:ro" nwtop-test python3 tests/helper.py --isolated \
+  target/release/nwtop target/release/nwtop-collector
 ```
 
 The Python integration tests use standard-library loopback sockets. Separate
@@ -367,10 +368,10 @@ Its terminal images and recording use explicit DEMO mode with synthetic traffic.
 
 Copyright (C) 2026 itmitalles
 
-nettop is free software: you can redistribute it and/or modify it under the
+nwtop is free software: you can redistribute it and/or modify it under the
 terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
-version (SPDX: `GPL-3.0-or-later`). nettop is distributed in the hope that it
+version (SPDX: `GPL-3.0-or-later`). nwtop is distributed in the hope that it
 will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
 the full license text.
@@ -379,3 +380,18 @@ the full license text.
 
 [GPL-3.0-or-later](LICENSE) · Inspired by htop and nvtop · No affiliation with other
 projects named nettop or ntop.
+
+### Upgrading from nettop
+
+The executable and capture helper are now `nwtop` and `nwtop-collector`.
+Run both installation scripts again, with `--extended-attribution` if used
+previously. Existing `nettop/config.json` preferences are read when no nwtop
+configuration exists; saving writes to `nwtop/config.json` and leaves the old
+file intact. The website remains at https://nettop.wutz.io during the rename.
+
+The installers preserve any older nettop installation. After verifying nwtop,
+remove your old `~/.local/bin/nettop` and `~/.local/bin/.nettop-install.sha256`.
+To retire its privileged helper, an administrator must also remove
+`/usr/local/libexec/nettop-collector` and
+`/usr/local/libexec/.nettop-collector.sha256`. Keep the old configuration until
+you have saved and verified your preferences in nwtop.

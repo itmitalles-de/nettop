@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise Setup and persisted preferences through the real terminal UI.
 
-Run without root: python3 tests/setup.py target/release/nettop
+Run without root: python3 tests/setup.py target/release/nwtop
 Every process uses a temporary XDG directory and its own pseudo-terminal.
 """
 
@@ -149,7 +149,7 @@ def run_once(binary, config_home, *arguments):
 
 
 def persistence_and_overrides(binary, config_home):
-    path = config_home / "nettop/config.json"
+    path = config_home / "nwtop/config.json"
     with Terminal(binary, config_home) as terminal:
         assert not path.exists(), "opening the monitor unexpectedly wrote settings"
         assert b"Settings:" not in terminal.output, "missing settings should silently use defaults"
@@ -184,7 +184,7 @@ def persistence_and_overrides(binary, config_home):
         terminal.expect(b"Saved ")
         mark = terminal.send(F10)
         terminal.expect(b"RX/s", mark)
-        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit nettop"
+        assert terminal.child.poll() is None, "F10 in Setup unexpectedly quit nwtop"
         terminal.quit()
 
     before = path.read_bytes()
@@ -211,11 +211,11 @@ def persistence_and_overrides(binary, config_home):
 
 
 def overrides_not_persisted(binary, config_home):
-    path = config_home / "nettop/config.json"
+    path = config_home / "nwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = {
         "version": 1,
-        "interface": "nettop-gone",
+        "interface": "nwtop-gone",
         "interval_ms": 1000,
         "history_seconds": 120,
         "bits": False,
@@ -227,7 +227,7 @@ def overrides_not_persisted(binary, config_home):
     arguments = ("--bits", "--interval", "0.1", "--history", "10", "--no-color")
     with Terminal(binary, config_home, arguments, NO_COLOR="1") as terminal:
         terminal.expect(b"unknown keys")
-        terminal.expect(b"Saved interface nettop-gone unavailable")
+        terminal.expect(b"Saved interface nwtop-gone unavailable")
         # Saving without changes keeps every file value, despite CLI overrides,
         # NO_COLOR and the automatic fallback for the missing interface.
         before = path.read_bytes()
@@ -252,7 +252,7 @@ def overrides_not_persisted(binary, config_home):
 
 
 def german_interface(binary, config_home):
-    path = config_home / "nettop/config.json"
+    path = config_home / "nwtop/config.json"
     with Terminal(binary, config_home, ready="Gerät".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
         terminal.expect("Hilfe".encode())
         terminal.expect("Speichern".encode())
@@ -272,7 +272,7 @@ def german_interface(binary, config_home):
 
 
 def malformed_settings(binary, config_home):
-    path = config_home / "nettop/config.json"
+    path = config_home / "nwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
     original = b'{"bits": true, this is deliberately incomplete\n'
     path.write_bytes(original)
@@ -297,30 +297,58 @@ def malformed_settings(binary, config_home):
 
 
 def vanished_interface(binary, config_home):
-    path = config_home / "nettop/config.json"
+    path = config_home / "nwtop/config.json"
     path.parent.mkdir(mode=0o700, parents=True)
-    path.write_text(json.dumps({"version": 1, "interface": "nettop-gone"}))
+    path.write_text(json.dumps({"version": 1, "interface": "nwtop-gone"}))
     path.chmod(0o600)
     original = path.read_bytes()
     stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
-    assert "Saved interface nettop-gone unavailable" in stderr, "missing interface had no warning"
+    assert "Saved interface nwtop-gone unavailable" in stderr, "missing interface had no warning"
     assert "automatic selection" in stderr, "interface warning did not explain the fallback"
     assert "enp112s0" in stdout.splitlines()[0], "missing interface did not use the demo default"
     assert path.read_bytes() == original, "automatic fallback overwrote the saved interface"
     print("PASS vanished interface: visible warning, automatic fallback, saved choice preserved")
 
 
+def legacy_preferences(binary, config_home):
+    legacy = config_home / "nettop/config.json"
+    current = config_home / "nwtop/config.json"
+    legacy.parent.mkdir(mode=0o700, parents=True)
+    original = json.dumps({"bits": True, "interface": "all", "future_option": {"kept": True}})
+    legacy.write_text(original)
+    legacy.chmod(0o600)
+    stdout, stderr = run_once(binary, config_home, "--interval", "0.1")
+    assert "bit/s" in stdout.splitlines()[1], "legacy units were not loaded"
+    assert "all interfaces" in stdout.splitlines()[0], "legacy interface was not loaded"
+    assert not current.exists(), "loading legacy preferences migrated without an explicit save"
+    assert "future_option" in stderr, "legacy unknown option was not reported"
+    with Terminal(binary, config_home) as terminal:
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(current) is not None, "F12 migrated legacy settings")
+        terminal.quit()
+    saved = read_saved(current)
+    assert saved["bits"] and saved["interface"] == "all", saved
+    assert saved["future_option"] == {"kept": True}, saved
+    assert legacy.read_text() == original, "migration modified the legacy settings"
+    saved["bits"] = False
+    current.write_text(json.dumps(saved))
+    stdout, _ = run_once(binary, config_home, "--interval", "0.1")
+    assert "B/s" in stdout.splitlines()[1], "legacy settings overrode the new settings"
+    print("PASS legacy preferences: nettop loads read-only, F12 writes nwtop, new settings win")
+
+
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/setup.py /path/to/nettop")
+        raise SystemExit("Usage: python3 tests/setup.py /path/to/nwtop")
     binary = Path(sys.argv[1]).resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="nettop-setup-test-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="nwtop-setup-test-") as temporary:
         root = Path(temporary)
         persistence_and_overrides(binary, root / "preferences")
         overrides_not_persisted(binary, root / "overrides")
         german_interface(binary, root / "german")
         malformed_settings(binary, root / "malformed")
         vanished_interface(binary, root / "vanished")
+        legacy_preferences(binary, root / "legacy")
     print("All Setup and configuration integration checks passed.")
 
 

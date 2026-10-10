@@ -1445,7 +1445,7 @@ mod tests {
     fn proc_reads_reject_truncated_files_and_exhausted_budget() {
         // memfd supplies an owned deterministic input without temporary paths
         // or changing any namespace/network configuration.
-        let raw = unsafe { libc::memfd_create(c"nettop-proc-bound".as_ptr(), libc::MFD_CLOEXEC) };
+        let raw = unsafe { libc::memfd_create(c"nwtop-proc-bound".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
         let mut file = unsafe { fs::File::from_raw_fd(raw) };
         use std::io::Write;

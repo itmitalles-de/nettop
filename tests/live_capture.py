@@ -132,7 +132,7 @@ def main():
     if os.geteuid() != 0:
         raise SystemExit("Run this integration test as root in an isolated test container.")
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python3 tests/live_capture.py /absolute/path/to/nettop")
+        raise SystemExit("Usage: python3 tests/live_capture.py /absolute/path/to/nwtop")
     binary = Path(sys.argv[1]).resolve(strict=True)
     for family in (socket.AF_INET, socket.AF_INET6):
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):

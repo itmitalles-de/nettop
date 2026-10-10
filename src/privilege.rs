@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn reset_environment_removes_injected_variables() {
-        const CHILD: &str = "NETTOP_TEST_RESET_ENVIRONMENT_CHILD";
+        const CHILD: &str = "NWTOP_TEST_RESET_ENVIRONMENT_CHILD";
         const NAME: &str = "privilege::tests::reset_environment_removes_injected_variables";
         if std::env::var_os(CHILD).is_some() {
             // SAFETY: this re-executed test process runs only this test on one
@@ -141,9 +141,9 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--test-threads=1"])
             .env(CHILD, "1")
-            .env("RDMAV_DRIVERS", "/tmp/nettop-test-injected")
-            .env("IBV_DRIVERS", "/tmp/nettop-test-injected")
-            .env("LD_LIBRARY_PATH", "/tmp/nettop-test-injected")
+            .env("RDMAV_DRIVERS", "/tmp/nwtop-test-injected")
+            .env("IBV_DRIVERS", "/tmp/nwtop-test-injected")
+            .env("LD_LIBRARY_PATH", "/tmp/nwtop-test-injected")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);

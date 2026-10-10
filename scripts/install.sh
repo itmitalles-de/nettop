@@ -17,8 +17,8 @@ fi
 : "${HOME:?HOME must be set}"
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 install_dir="$HOME/.local/bin"
-destination="$install_dir/nettop"
-receipt="$install_dir/.nettop-install.sha256"
+destination="$install_dir/nwtop"
+receipt="$install_dir/.nwtop-install.sha256"
 staged_binary=''
 staged_receipt=''
 
@@ -63,10 +63,10 @@ check_destination() {
 
 build_options=()
 if (( extended )); then
-    bpf_clang="${NETTOP_BPF_CLANG:-clang}"
+    bpf_clang="${NWTOP_BPF_CLANG:-clang}"
     if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
         ! "$bpf_clang" --print-targets 2>/dev/null | grep -q 'bpfel'; then
-        printf 'Extended attribution requires clang with the bpfel target; install clang or set NETTOP_BPF_CLANG.\n' >&2
+        printf 'Extended attribution requires clang with the bpfel target; install clang or set NWTOP_BPF_CLANG.\n' >&2
         exit 1
     fi
     if ! "$bpf_clang" -E -x c - >/dev/null 2>&1 <<'HEADERS'
@@ -84,9 +84,9 @@ fi
 check_destination
 cargo build --release --locked "${build_options[@]}" --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
 mkdir -p -- "$install_dir"
-staged_binary="$(mktemp "$install_dir/.nettop-binary.XXXXXX")"
-staged_receipt="$(mktemp "$install_dir/.nettop-receipt.XXXXXX")"
-install -m 755 -- "$repo_dir/target/release/nettop" "$staged_binary"
+staged_binary="$(mktemp "$install_dir/.nwtop-binary.XXXXXX")"
+staged_receipt="$(mktemp "$install_dir/.nwtop-receipt.XXXXXX")"
+install -m 755 -- "$repo_dir/target/release/nwtop" "$staged_binary"
 read -r installed_digest _ < <(sha256sum -- "$staged_binary")
 printf '%s\n' "$installed_digest" > "$staged_receipt"
 chmod 600 -- "$staged_receipt"

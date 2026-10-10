@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Snapshot;
 
-pub const HELPER_PATH: &str = "/usr/local/libexec/nettop-collector";
+pub const HELPER_PATH: &str = "/usr/local/libexec/nwtop-collector";
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_REQUEST: usize = 1024;
 const MAX_RESPONSE: usize = 32 * 1024 * 1024;
@@ -29,7 +29,7 @@ pub struct Request {
 impl Request {
     pub fn validate(&self) -> Result<()> {
         if self.version != PROTOCOL_VERSION {
-            bail!("collector protocol mismatch; rerun capture setup after updating nettop");
+            bail!("collector protocol mismatch; rerun capture setup after updating nwtop");
         }
         if let Some(name) = &self.interface
             && (name.is_empty()

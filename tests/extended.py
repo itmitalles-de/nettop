@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real sub-poll-interval TCP/UDP attribution; explicitly isolated QEMU/KVM only.
 
-Usage: sudo python3 tests/extended.py --isolated-vm /path/to/nettop
+Usage: sudo python3 tests/extended.py --isolated-vm /path/to/nwtop
 The binary must include the ebpf feature. No host tracing is permitted.
 """
 import argparse
@@ -93,7 +93,7 @@ def run_case(binary, family, kind, exit_early=False):
     server = mp.Process(target=receiver, args=(family, kind, count, child, finished, exit_early))
     monitor = None
     try:
-        with tempfile.TemporaryDirectory(prefix="nettop-extended-") as config:
+        with tempfile.TemporaryDirectory(prefix="nwtop-extended-") as config:
             env = dict(os.environ, XDG_CONFIG_HOME=config)
             monitor = subprocess.Popen(
                 [str(binary), "--interface", "lo", "--json", "--interval", "5"],
@@ -198,7 +198,7 @@ def run_burst(binary):
     """Cross libbpf's callback batch limit without overflowing packet queues."""
     count = 2500
     payload = b"b" * 32
-    with tempfile.TemporaryDirectory(prefix="nettop-event-burst-") as config:
+    with tempfile.TemporaryDirectory(prefix="nwtop-event-burst-") as config:
         monitor = subprocess.Popen(
             [str(binary), "--json", "--interface", "lo", "--interval", "5"],
             env=dict(os.environ, XDG_CONFIG_HOME=config, LANG="C"),
