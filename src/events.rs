@@ -3,7 +3,10 @@
 //! One worker owns every link, map and ring buffer. No object paths, pins or
 //! payload bytes cross this boundary; dropping it detaches all its programs.
 
+use super::capture::Wake;
 use anyhow::Result;
+#[cfg(not(feature = "ebpf"))]
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -30,9 +33,33 @@ pub(super) struct Event {
 
 const _: () = assert!(std::mem::size_of::<Event>() == 112);
 
+/// One header-only IP skb observed at an actual socket endpoint. Addresses
+/// are the packet's wire tuple, which may differ from the socket after NAT.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PacketEvent {
+    pub timestamp_ns: u64,
+    pub socket_id: u64,
+    pub inode: u64,
+    pub netns: u32,
+    pub ifindex: u32,
+    pub ip_bytes: u32,
+    pub family: u16,
+    pub protocol: u16,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub receive: u8,
+    pub flags: u8,
+    pub reserved: u16,
+    pub local_addr: [u8; 16],
+    pub remote_addr: [u8; 16],
+}
+const _: () = assert!(std::mem::size_of::<PacketEvent>() == 80);
+
 #[derive(Default)]
 pub(super) struct Batch {
     pub events: Vec<Event>,
+    pub packets: Vec<PacketEvent>,
     pub lost: u64,
     pub losses: Losses,
     pub error: Option<String>,
@@ -95,7 +122,7 @@ pub(super) struct Events;
 
 #[cfg(not(feature = "ebpf"))]
 impl Events {
-    pub(super) fn start() -> Result<Self> {
+    pub(super) fn start(_wake: Arc<Wake>) -> Result<Self> {
         anyhow::bail!("extended attribution is not included; install with --extended-attribution")
     }
 
@@ -109,7 +136,7 @@ pub(super) use enabled::Events;
 
 #[cfg(feature = "ebpf")]
 mod enabled {
-    use super::{Batch, Event, Losses, Result};
+    use super::{Batch, Event, Losses, PacketEvent, Result, Wake};
     use anyhow::{Context, anyhow, bail};
     use libloading::Library;
     use std::ffi::{CStr, c_char, c_int, c_long, c_void};
@@ -215,13 +242,19 @@ mod enabled {
         // Box that outlives the ring and data is valid for this callback only.
         let state = unsafe { &mut *context.cast::<CallbackState>() };
         let buffer = &mut state.batch;
-        if data.is_null() || size != std::mem::size_of::<Event>() {
+        if data.is_null()
+            || (size != std::mem::size_of::<Event>() && size != std::mem::size_of::<PacketEvent>())
+        {
             buffer.lost = buffer.lost.saturating_add(1);
             buffer.losses.0[6] = buffer.losses.0[6].saturating_add(1);
             buffer.error = Some("invalid socket-event record".to_string());
-        } else if buffer.events.len() >= MAX_POLL_EVENTS {
+        } else if buffer.events.len() + buffer.packets.len() >= MAX_POLL_EVENTS {
             buffer.lost = buffer.lost.saturating_add(1);
             buffer.losses.0[4] = buffer.losses.0[4].saturating_add(1);
+        } else if size == std::mem::size_of::<PacketEvent>() {
+            buffer
+                .packets
+                .push(unsafe { ptr::read_unaligned(data.cast::<PacketEvent>()) });
         } else {
             // Ring records need not satisfy Rust's alignment requirement.
             let event = unsafe { ptr::read_unaligned(data.cast::<Event>()) };
@@ -253,10 +286,12 @@ mod enabled {
         shared: &Mutex<Batch>,
         losses: Losses,
         error: Option<String>,
+        wake: Option<&Wake>,
     ) -> bool {
         let Ok(mut shared) = shared.lock() else {
             return false;
         };
+        let previous_size = shared.events.len() + shared.packets.len();
         shared.lost = shared
             .lost
             .saturating_add(losses.total())
@@ -266,12 +301,16 @@ mod enabled {
         staged.lost = 0;
         if let Some(error) = error.or_else(|| staged.error.take()) {
             staged.events.clear();
+            staged.packets.clear();
             shared.lost = shared.lost.saturating_add(1);
             shared.losses.0[7] = shared.losses.0[7].saturating_add(1);
             shared.error = Some(error);
+            if let Some(wake) = wake {
+                wake.notify();
+            }
             return false;
         }
-        let available = MAX_EVENTS.saturating_sub(shared.events.len());
+        let available = MAX_EVENTS.saturating_sub(shared.events.len() + shared.packets.len());
         let accepted = staged.events.len().min(available);
         shared.lost = shared
             .lost
@@ -280,6 +319,19 @@ mod enabled {
             shared.losses.0[5].saturating_add((staged.events.len() - accepted) as u64);
         shared.events.extend(staged.events.drain(..accepted));
         staged.events.clear();
+        let available = MAX_EVENTS.saturating_sub(shared.events.len() + shared.packets.len());
+        let accepted = staged.packets.len().min(available);
+        let dropped = (staged.packets.len() - accepted) as u64;
+        shared.lost = shared.lost.saturating_add(dropped);
+        shared.losses.0[5] = shared.losses.0[5].saturating_add(dropped);
+        shared.packets.extend(staged.packets.drain(..accepted));
+        staged.packets.clear();
+        if previous_size < MAX_EVENTS / 4
+            && shared.events.len() + shared.packets.len() >= MAX_EVENTS / 4
+            && let Some(wake) = wake
+        {
+            wake.notify();
+        }
         true
     }
 
@@ -295,11 +347,19 @@ mod enabled {
         nested_last_depth: u64,
         nested_kind_mask: u64,
         pending_delete_failures: u64,
+        fatal_socket_reuse: u64,
     }
 
-    const _: () = assert!(std::mem::size_of::<Statistics>() == 72);
+    const _: () = assert!(std::mem::size_of::<Statistics>() == 80);
 
     impl Statistics {
+        fn check(self) -> Result<()> {
+            if self.fatal_socket_reuse > 0 {
+                bail!("socket identity cleanup failed; packet attribution stopped until restart");
+            }
+            Ok(())
+        }
+
         fn delta(self, previous: Self) -> Losses {
             let nested = self.nested_calls.saturating_sub(previous.nested_calls);
             Losses([
@@ -473,7 +533,7 @@ mod enabled {
     }
 
     impl Events {
-        pub(in super::super) fn start() -> Result<Self> {
+        pub(in super::super) fn start(wake: Arc<Wake>) -> Result<Self> {
             let buffer = Arc::new(Mutex::new(Batch::default()));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_buffer = Arc::clone(&buffer);
@@ -513,6 +573,9 @@ mod enabled {
                         // actor followed by CLOSE and must be withheld now.
                         let lost = match session.stats() {
                             Ok(stats) => {
+                                if let Err(problem) = stats.check() {
+                                    error = Some(problem.to_string());
+                                }
                                 let lost = stats.delta(previous);
                                 previous = stats;
                                 lost
@@ -522,7 +585,13 @@ mod enabled {
                                 Losses::default()
                             }
                         };
-                        if !publish(&mut session.context.batch, &thread_buffer, lost, error) {
+                        if !publish(
+                            &mut session.context.batch,
+                            &thread_buffer,
+                            lost,
+                            error,
+                            Some(&wake),
+                        ) {
                             return;
                         }
                     }
@@ -555,6 +624,7 @@ mod enabled {
             };
             Batch {
                 events: std::mem::take(&mut buffer.events),
+                packets: std::mem::take(&mut buffer.packets),
                 lost: std::mem::take(&mut buffer.lost),
                 losses: std::mem::take(&mut buffer.losses),
                 error: buffer.error.clone(),
@@ -574,6 +644,91 @@ mod enabled {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn endpoint_packet_pressure_wakes_the_shared_attribution_worker() {
+            let wake = Arc::new(Wake::default());
+            let waiting = Arc::clone(&wake);
+            let (done, result) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                waiting.wait(Duration::from_secs(5));
+                done.send(()).unwrap();
+            });
+            let shared = Mutex::new(Batch {
+                events: vec![Event::default(); MAX_EVENTS / 4 - 1],
+                ..Batch::default()
+            });
+            let mut staged = Batch {
+                packets: vec![PacketEvent::default()],
+                ..Batch::default()
+            };
+            assert!(publish(
+                &mut staged,
+                &shared,
+                Losses::default(),
+                None,
+                Some(&wake)
+            ));
+            result.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(shared.lock().unwrap().lost, 0);
+        }
+
+        #[test]
+        fn packet_records_share_loss_publication_and_queue_bounds_with_lifecycle() {
+            let shared = Mutex::new(Batch::default());
+            let mut context = CallbackState {
+                batch: Batch::default(),
+                polled: 0,
+            };
+            let mut packet = PacketEvent {
+                ip_bytes: 1052,
+                socket_id: 4,
+                ..PacketEvent::default()
+            };
+            let mut lifecycle = Event {
+                socket_id: 4,
+                ..Event::default()
+            };
+            unsafe {
+                receive(
+                    (&mut context as *mut CallbackState).cast(),
+                    (&mut packet as *mut PacketEvent).cast(),
+                    80,
+                );
+                receive(
+                    (&mut context as *mut CallbackState).cast(),
+                    (&mut lifecycle as *mut Event).cast(),
+                    112,
+                );
+            }
+            assert!(shared.lock().unwrap().packets.is_empty());
+            assert!(publish(
+                &mut context.batch,
+                &shared,
+                Losses([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                None,
+                None
+            ));
+            let mut published = shared.lock().unwrap();
+            assert_eq!(published.packets[0].ip_bytes, 1052);
+            assert_eq!(published.events[0].socket_id, 4);
+            assert_eq!(published.lost, 1);
+            published.events.resize(MAX_EVENTS - 1, Event::default());
+            drop(published);
+            context.batch.packets.push(packet);
+            assert!(publish(
+                &mut context.batch,
+                &shared,
+                Losses::default(),
+                None,
+                None
+            ));
+            let published = shared.lock().unwrap();
+            assert_eq!(published.packets.len(), 1);
+            assert_eq!(published.lost, 2);
+            assert_eq!(published.losses.0[5], 1);
+        }
 
         #[test]
         fn every_exit_is_attached_before_any_entry_and_removed_after_it() {
@@ -631,6 +786,7 @@ mod enabled {
                     &mut context.batch,
                     &shared,
                     Losses::default(),
+                    None,
                     None
                 ));
                 polls += 1;
@@ -700,6 +856,7 @@ mod enabled {
                 &mut context.batch,
                 &shared,
                 Losses([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                None,
                 None
             ));
             let published = shared.lock().unwrap();
@@ -723,6 +880,7 @@ mod enabled {
                 &mut staged,
                 &shared,
                 Losses([3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                None,
                 None
             ));
             assert_eq!(shared.lock().unwrap().events.len(), MAX_EVENTS);
@@ -735,7 +893,8 @@ mod enabled {
                 &mut staged,
                 &shared,
                 Losses::default(),
-                Some("stats failed".into())
+                Some("stats failed".into()),
+                None
             ));
             let published = shared.lock().unwrap();
             assert_eq!(published.lost, 6);
@@ -746,6 +905,38 @@ mod enabled {
             assert_eq!(published.losses.total(), published.lost);
             assert_eq!(published.error.as_deref(), Some("stats failed"));
             assert!(staged.events.is_empty());
+        }
+
+        #[test]
+        fn final_socket_identity_cleanup_failure_remains_fatal_across_drains() {
+            let stats = Statistics {
+                fatal_socket_reuse: 1,
+                ..Statistics::default()
+            };
+            assert!(stats.check().is_err());
+            assert_eq!(stats.delta(stats).total(), 0);
+            assert!(stats.check().is_err()); // No new counter delta does not recover it.
+            let shared = Mutex::new(Batch::default());
+            let mut staged = Batch {
+                packets: vec![PacketEvent::default()],
+                ..Batch::default()
+            };
+            assert!(!publish(
+                &mut staged,
+                &shared,
+                Losses::default(),
+                stats.check().err().map(|e| e.to_string()),
+                None
+            ));
+            let published = shared.lock().unwrap();
+            assert!(published.packets.is_empty());
+            assert!(
+                published
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("until restart")
+            );
         }
 
         #[test]
@@ -760,6 +951,7 @@ mod enabled {
                 nested_last_depth: 2,
                 nested_kind_mask: 6,
                 pending_delete_failures: 6,
+                fatal_socket_reuse: 0,
             };
             assert_eq!(stats.delta(Statistics::default()).total(), 21);
             assert_eq!(

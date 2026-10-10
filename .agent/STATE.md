@@ -1,68 +1,56 @@
 # Verified state
 
-## Optional attribution implementation (2026-10-10)
+## Optional attribution completion (2026-10-10)
 
-- Implementation merged as [PR #11](https://github.com/itmitalles-de/nettop/pull/11)
-  (`cbb33c5`, implementation `98ccdb5`), closing #2.
-- Opt-in `ebpf` build adds socket lifecycle events, namespace inventories,
-  conntrack translation/reuse quarantine, veth deduplication and visible degraded
-  status. Both installer scripts accept `--extended-attribution`; standard
-  builds require neither clang/libbpf nor extra capabilities. Capture starts
-  before the initial descriptor scan. Captured IP packets remain the byte source.
-- Extended helper grants BPF, PERFMON and NET_ADMIN in addition to the standard
-  capture/read capabilities. BPF and capture workers drop all capabilities;
-  conntrack retains only NET_ADMIN and sampling only process-read capabilities.
-  VM checks verified the unprivileged UI, exact per-thread limits, NO_NEW_PRIVS
-  and complete helper/probe cleanup. No permanent service or pinned BPF object.
-- Linux 6.8 x86_64 VM tests cover sub-millisecond TCP/UDP IPv4/IPv6 sockets,
-  exited owners, and 16 positive namespace/NAT cases (tracked direct, DNAT, SNAT,
-  combined NAT and host hairpin, All and selected interfaces). Separate negative
-  cases passed with conservative untracked-flow attribution and a visible notice.
-  One earlier VM run rejected five uncertain timestamps; an unchanged repeat
-  passed. Preserve the log and extend stress coverage in #10.
-  ARM64 BPF compilation passed; runtime coverage remains x86_64.
-- Standard terminal/setup, isolated live TCP/UDP, short-socket and capability
-  helper checks passed, including extended-build fallback without extra rights.
-  Formatting, Clippy in both configurations, Rust tests including 1.88.0,
-  ShellCheck and Cargo Audit passed. CI adds optional-feature compilation/tests.
-- Remaining work: [#8](https://github.com/itmitalles-de/nettop/issues/8)
-  untracked long-lived flows, [#9](https://github.com/itmitalles-de/nettop/issues/9)
-  namespace capture boundaries, [#10](https://github.com/itmitalles-de/nettop/issues/10)
-  further adversarial/kernel runtime coverage, and
-  [#13](https://github.com/itmitalles-de/nettop/issues/13) bounded packet-queue
-  pressure under host load. Missing conntrack mappings never
-  prove absence of NAT, and nettop does not change firewall rules.
-- Startup follow-up [PR #14](https://github.com/itmitalles-de/nettop/pull/14)
-  merged as `5caf4cc` (implementation `12bae0e`), closing #12. It fixes
-  libbpf callback yielding (negative return),
-  attaches exits before entries and arms metadata recording only after all
-  links are installed. Bounded loss diagnostics persist through quarantine;
-  pending-map deletion failures are checked. The system-dependent IPv6 cache
-  test now asserts only on its own socket.
-- Real kernel regressions prove both fixes: 5000 queued metadata events no
-  longer discard later events; deliberately incomplete attachment produces
-  nested-call losses unless recording remains disarmed until setup completes.
-  All six VM live cases and capability/cleanup checks passed on the final
-  build. Formatting, Clippy in both modes and 141 Rust tests (also 1.88.0)
-  passed. PR #14 standard/extended/MSRV/audit CI and all five CodeQL analyses
-  passed; independent review found no material issues.
-- Local `main` is synchronized; the merged local/remote work branch was
-  removed. Extended UI and helper are installed on Linux 7.0 from this follow-up.
-  Twelve fresh host starts showed no socket-event loss or ownership quarantine,
-  known TX 3.85–4.05 MB/s and unknown TX 0–2.15 kB/s. Eleven samples had no
-  packet overflow; one reported 438 packets at the flow limit without event
-  loss or loss of normal attribution (#13). A final `--once` exited cleanly
-  with roughly 4 MiB/s TX and unknown RX/TX of 138/95 B/s.
-  Do not report that all host checks
-  were overflow-free. The untracked-flow notice remains expected under #8.
-  UI has no capabilities; helper is root:tim 0750 with the extended set.
-  Verified SHA-256: UI `4ee579712ae9c9321ff6555f5a41e2aa482eb591fb534785de2e2443878f14ac`,
-  helper `9a66ba48a869e8ba32bcfa1d9ae084a7c8c4a3f3601d96a12366c50778d22162`.
-- Private evidence and the dedicated QEMU guest are outside Git under
-  `../nettop-review/issue-2/`; use generated VM wrappers/current PID files,
-  never stale ports. The Linux 6.8.0-146 guest is stopped; process exit and SSH
-  closure were verified. Retain evidence and keep credentials and raw runtime
-  snapshots out of Git.
+- Current implementation: `b5f3b56`, [PR #15](https://github.com/itmitalles-de/nettop/pull/15),
+  addressing #8, #9, #10 and #13. Earlier optional-backend work merged through
+  PR #11 (`cbb33c5`, closing #2) and PR #14 (`5caf4cc`, closing #12).
+- Extended All process totals use captured TCP/UDP IP skbs at actual socket
+  endpoints across namespaces. All 23 BPF hooks attach before recording starts.
+  Socket incarnation plus process/descriptor evidence resolves untracked queued
+  traffic without inferring NAT from missing conntrack. No payloads, syscall
+  byte counters, namespace entry or additional capabilities were introduced.
+- Selected host interfaces retain conservative pcap/conntrack accounting;
+  untracked traffic may remain unknown there. Pure forwarding requires a
+  selected interface. Interface graphs retain host kernel counters, whereas All
+  process totals cover accessible namespaces. GRO/GSO/fragmentation are counted
+  as observed IP skbs, not reconstructed wire segments. These scopes are visible
+  in status and documented in README and ARCHITECTURE.
+- Sharing, reused identities and lost metadata remain conservative. Fatal socket
+  identity cleanup failure disarms the backend until restart; All becomes
+  unavailable instead of switching byte sources. UDP connection rows use actual
+  packet endpoints; incomplete ports contribute only process bytes.
+- Capture and attribution queue pressure have separate notices. Both bounded
+  capture sources wake attribution at one-quarter capacity; wait-queue pressure
+  preserves known endpoints and unknown captured bytes. Limits were not raised.
+- Verified: formatting, Clippy in both modes, 150 extended Rust tests including
+  Rust 1.88, standard isolated live/short-lived TCP/UDP, capability helper,
+  terminal and settings tests. Implementation CI and all five CodeQL analyses
+  passed. Independent production and harness reviews were resolved.
+- Real guests: 46 namespace/NAT/NOTRACK cases on x86_64 Linux 6.8, plus four
+  competing pre-DNAT-listener reruns on Linux 7.0. Linux 7.0 passed all ten
+  adversarial cases in both All and selected scopes (20 cases). ARM64 Linux 6.8
+  executed all 23 hooks and six application cases. Helper capabilities/cleanup
+  and fatal-deletion fault injection passed. See tests/adversarial.md for exact
+  coverage and retained emulation-related timeout/timestamp diagnostics; no
+  safety guard or product deadline was relaxed.
+- Six final Linux 7.0 pressure cases passed: 4096/20000/80000 datagrams in both
+  scopes. All retained 100% of expected IP bytes at every size; larger selected
+  bursts retained about 92.8%/92.7%, with visible pcap losses. No duplicate totals;
+  maximum sampled RSS 23,392 KiB. No claim of loss-free pcap at arbitrary loads.
+- Extended UI and helper installed and hashes verified before host testing.
+  Twelve fresh All starts on the host had zero drops, queue overflows or
+  socket-event failures; known TX 4.10–4.50 MB/s, unknown RX/TX below 0.8 kB/s.
+  A final --once exited cleanly. Ordinary non-IP frames remained visibly counted
+  as unsupported. UI has no capabilities; helper is root:tim 0750 with
+  DAC_READ_SEARCH, NET_ADMIN, NET_RAW, SYS_PTRACE, PERFMON and BPF.
+  UI SHA-256: `6fb79f9c2963ad3864a61511e7538a8e61796a1e9cd88a0c765659cb7993ce5b`;
+  helper: `d41e1cd88dede5be2c1c1c767e2b895e14552d5e07389032a919edf7ad48b6c4`.
+- Both owned VMs are shut down; PID absence and closed SSH ports verified.
+  Private evidence is outside Git: ../nettop-review/remaining/VM-VALIDATION.md,
+  ../nettop-review/remaining-attribution/{namespaces,host-final}/ and the initial
+  pressure comparison in ../nettop-review/issue-2/. Retain overlays/evidence;
+  use generated wrappers/current port files when restarting, never stale ports.
 
 ## Completed baseline
 

@@ -77,6 +77,7 @@ pub enum CaptureNote {
     },
     NoInterfaceIndexes,
     AllInterfaces,
+    AllSocketPackets,
     /// The routine explanation; the UI keeps it in F1 Help only.
     Sampled,
     /// Optional socket events, namespace inventory and NAT metadata.
@@ -88,6 +89,12 @@ pub enum CaptureNote {
         packets: u64,
     },
     FlowLimit {
+        packets: u64,
+    },
+    CaptureQueueLimit {
+        packets: u64,
+    },
+    AttributionQueueLimit {
         packets: u64,
     },
     Unreadable {

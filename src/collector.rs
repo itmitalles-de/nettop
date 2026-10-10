@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -147,6 +147,7 @@ struct IntervalStatus {
     timestamp_invalid: u64,
     dropped: u64,
     overflow: u64,
+    attribution_overflow: u64,
     unsupported: u64,
     truncated: u64,
 }
@@ -186,7 +187,8 @@ fn lock(shared: &Mutex<Attribution>) -> MutexGuard<'_, Attribution> {
 
 /// Stops and joins the background attribution thread on drop.
 struct Worker {
-    stop: Option<mpsc::Sender<()>>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<capture::Wake>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -195,16 +197,23 @@ impl Worker {
     /// capabilities and NO_NEW_PRIVS: in the helper only the /proc read
     /// capabilities, never the capture capability.
     fn start(shared: Arc<Mutex<Attribution>>) -> Result<Self> {
-        let (stop, stopped) = mpsc::channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let wake = lock(&shared)
+            .capture
+            .as_ref()
+            .map(|capture| Arc::clone(&capture.wake))
+            .unwrap_or_default();
+        let thread_wake = Arc::clone(&wake);
         let handle = thread::Builder::new()
             .name("nettop-attrib".to_string())
             .spawn(move || {
                 let mut wait = ATTRIBUTION_TICK;
                 let mut topology = TopologyCache::default();
                 loop {
-                    match stopped.recv_timeout(wait) {
-                        Err(RecvTimeoutError::Timeout) => {}
-                        _ => return,
+                    thread_wake.wait(wait);
+                    if thread_stop.load(Ordering::Relaxed) {
+                        return;
                     }
                     let started = Instant::now();
                     let interfaces = local_interfaces(&mut topology);
@@ -215,7 +224,8 @@ impl Worker {
             })
             .context("starting socket attribution worker")?;
         Ok(Self {
-            stop: Some(stop),
+            stop,
+            wake,
             handle: Some(handle),
         })
     }
@@ -223,7 +233,8 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        drop(self.stop.take());
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake.notify();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -248,7 +259,9 @@ impl Collector {
     pub fn new(capture_enabled: bool) -> Result<Self> {
         let started = Instant::now();
         let mut inventory = Inventory::new();
-        let extended = (capture_enabled && cfg!(feature = "ebpf")).then(extended::Extended::start);
+        let wake = Arc::new(capture::Wake::default());
+        let extended = (capture_enabled && cfg!(feature = "ebpf"))
+            .then(|| extended::Extended::start(Arc::clone(&wake)));
         inventory.set_namespace_discovery(extended.as_ref().is_some_and(|e| e.available()));
         let interfaces = read_interfaces()?;
         let previous_interfaces = interfaces
@@ -266,7 +279,7 @@ impl Collector {
             .collect();
         let last_sample = Instant::now();
         let (capture, capture_note) = if capture_enabled {
-            match capture::Capture::start() {
+            match capture::Capture::start(wake) {
                 Ok(capture) => (Some(capture), None),
                 Err(error) => {
                     let note = match error.downcast_ref::<capture::StartError>() {
@@ -373,8 +386,13 @@ impl Collector {
                 });
             }
             if problems.overflow > 0 {
-                status.notes.push(CaptureNote::FlowLimit {
+                status.notes.push(CaptureNote::CaptureQueueLimit {
                     packets: problems.overflow,
+                });
+            }
+            if problems.attribution_overflow > 0 {
+                status.notes.push(CaptureNote::AttributionQueueLimit {
+                    packets: problems.attribution_overflow,
                 });
             }
             if problems.unsupported > 0 || problems.truncated > 0 {
@@ -396,11 +414,22 @@ impl Collector {
             }
         }
         if let Some(extended) = &state.extended {
+            let socket_packets = interface.is_none() && extended.packet_capture_active();
+            if socket_packets {
+                for note in &mut status.notes {
+                    if *note == CaptureNote::AllInterfaces {
+                        *note = CaptureNote::AllSocketPackets;
+                    }
+                }
+            }
+            if interface.is_none() && extended.packet_capture_failed() {
+                status.active = false;
+            }
             if extended.available() {
                 status.notes.retain(|note| *note != CaptureNote::Sampled);
                 status.notes.push(CaptureNote::Extended);
             }
-            if extended.available() && problems.timestamp_invalid > 0 {
+            if extended.available() && !socket_packets && problems.timestamp_invalid > 0 {
                 status.notes.push(CaptureNote::ExtendedIssue {
                     detail: format!(
                         "{} packet timestamps unavailable; uncertain event owners withheld",
@@ -413,7 +442,7 @@ impl Collector {
                     detail: detail.clone(),
                 });
             }
-            if extended.unconfirmed.replace(false) {
+            if extended.unconfirmed.replace(false) && !socket_packets {
                 status.notes.push(CaptureNote::ExtendedIssue {
                     detail: "no confirmed conntrack entry for some flows; only positive socket events can attribute them".into(),
                 });
@@ -497,6 +526,14 @@ impl Attribution {
         }
         if let Some(extended) = &mut self.extended {
             let pending = std::mem::take(&mut extended.pending);
+            let pending_packets = std::mem::take(&mut extended.pending_packets);
+            let packets = extended.take_packets();
+            for item in pending_packets {
+                self.attribute_packet(item.packet, item.since, now);
+            }
+            for packet in packets {
+                self.attribute_packet(packet, drained, now);
+            }
             for item in pending {
                 self.attribute_extended(item.flow, item.bytes, item.since, now, &view);
             }
@@ -513,7 +550,7 @@ impl Attribution {
                 }
             }
         }
-        for ((index, direction), untracked) in batch.untracked {
+        for ((index, direction, socket_protocol), untracked) in batch.untracked {
             let bytes = match direction {
                 _ if view.loopback.contains(&index) => Bytes {
                     rx: untracked.bytes,
@@ -529,9 +566,64 @@ impl Attribution {
                 },
                 Direction::Unknown => Bytes::default(),
             };
-            self.counters
-                .record_unknown(Link::plain(index), bytes, now, &mut self.deltas.unknown);
+            self.counters.record_unknown(
+                Link {
+                    index,
+                    lower: socket_protocol
+                        && self
+                            .extended
+                            .as_ref()
+                            .is_some_and(|e| e.packet_capture_active()),
+                },
+                bytes,
+                now,
+                &mut self.deltas.unknown,
+            );
         }
+    }
+
+    /// Socket-bound IP packet observations are the sole All-interface source
+    /// when enabled. Namespace-local ifindexes must never select host links.
+    fn attribute_packet(&mut self, packet: events::PacketEvent, since: Instant, now: Instant) {
+        let extended = self.extended.as_mut().expect("extended packet path");
+        let expired = now.saturating_duration_since(since) >= Duration::from_secs(2);
+        let mut result = extended.resolve_packet(&packet, &self.inventory, expired);
+        if matches!(result, extended::PacketResult::Pending) {
+            if extended.pending_packets.len() < MAX_DEFERRED {
+                extended
+                    .pending_packets
+                    .push(extended::PendingPacket { packet, since });
+                return;
+            }
+            self.status.attribution_overflow = self.status.attribution_overflow.saturating_add(1);
+            result = extended.resolve_packet(&packet, &self.inventory, true);
+        }
+        let bytes = if packet.receive != 0 {
+            Bytes {
+                rx: u64::from(packet.ip_bytes),
+                tx: 0,
+            }
+        } else {
+            Bytes {
+                rx: 0,
+                tx: u64::from(packet.ip_bytes),
+            }
+        };
+        let link = Link::plain(0);
+        if let extended::PacketResult::Owned(socket, connection_known) = result
+            && self.counters.record_owned(
+                link,
+                &socket,
+                connection_known,
+                bytes,
+                now,
+                &mut self.deltas,
+            )
+        {
+            return;
+        }
+        self.counters
+            .record_unknown(link, bytes, now, &mut self.deltas.unknown);
     }
 
     fn attribute_extended(
@@ -543,8 +635,23 @@ impl Attribution {
         view: &LocalView,
     ) {
         let extended = self.extended.as_mut().expect("extended path");
+        let selected_only = extended.packet_capture_active()
+            && matches!(flow.protocol, packet::Protocol::Tcp | packet::Protocol::Udp);
         let expired = now.saturating_duration_since(since) >= Duration::from_secs(2);
-        match extended.resolve(&flow, bytes, &self.inventory, view, expired) {
+        let resolution = extended.resolve(&flow, bytes, &self.inventory, view, expired);
+        let resolution = if matches!(resolution, extended::Result::Pending)
+            && !expired
+            && extended.pending.len() >= MAX_DEFERRED
+        {
+            // Preserve whichever endpoint is already proven. Queue pressure
+            // ends the wait, never turns known bytes into unknown bytes or
+            // permits an otherwise ambiguous owner.
+            self.status.attribution_overflow = self.status.attribution_overflow.saturating_add(1);
+            extended.resolve(&flow, bytes, &self.inventory, view, true)
+        } else {
+            resolution
+        };
+        match resolution {
             extended::Result::Owned(owners, unresolved) => {
                 for (socket, receive, lower, connection_known) in owners {
                     let increment = if receive {
@@ -560,7 +667,7 @@ impl Attribution {
                     };
                     let link = Link {
                         index: flow.interface_index,
-                        lower,
+                        lower: lower || selected_only,
                     };
                     if !self.counters.record_owned(
                         link,
@@ -593,7 +700,7 @@ impl Attribution {
                     self.counters.record_unknown(
                         Link {
                             index: flow.interface_index,
-                            lower,
+                            lower: lower || selected_only,
                         },
                         increment,
                         now,
@@ -608,14 +715,14 @@ impl Attribution {
                     .push(extended::Pending { flow, bytes, since });
                 return;
             }
-            extended::Result::Pending if !expired => {
-                self.status.overflow = self.status.overflow.saturating_add(1);
-            }
             _ => {}
         }
         let (rx, tx) = traffic_sides(&flow, view);
         self.counters.record_unknown(
-            Link::plain(flow.interface_index),
+            Link {
+                index: flow.interface_index,
+                lower: selected_only,
+            },
             Bytes {
                 rx: if rx { bytes.bytes } else { 0 },
                 tx: if tx { bytes.bytes } else { 0 },
@@ -1817,6 +1924,54 @@ mod tests {
         assert_eq!(
             attribution.counters.unattributed[&Link::plain(2)].bytes.rx,
             200
+        );
+    }
+
+    #[test]
+    fn endpoint_packet_pressure_preserves_bytes_and_host_scope() {
+        let mut attribution = Attribution::new(Inventory::new(), None);
+        attribution.extended = Some(extended::Extended::empty_for_test());
+        let now = Instant::now();
+        let packet = events::PacketEvent {
+            ip_bytes: 128,
+            receive: 1,
+            ifindex: 1,
+            ..Default::default()
+        };
+        for _ in 0..MAX_DEFERRED + 17 {
+            attribution.attribute_packet(packet, now, now);
+        }
+        assert_eq!(
+            attribution.extended.as_ref().unwrap().pending_packets.len(),
+            MAX_DEFERRED
+        );
+        assert_eq!(attribution.status.attribution_overflow, 17);
+        assert_eq!(attribution.status.overflow, 0);
+        assert_eq!(
+            attribution.counters.unattributed[&Link::plain(0)].bytes.rx,
+            17 * 128
+        );
+        let pending = std::mem::take(&mut attribution.extended.as_mut().unwrap().pending_packets);
+        let later = now + Duration::from_secs(3);
+        for item in pending {
+            attribution.attribute_packet(item.packet, item.since, later);
+        }
+        assert!(
+            attribution
+                .extended
+                .as_ref()
+                .unwrap()
+                .pending_packets
+                .is_empty()
+        );
+        assert_eq!(
+            attribution.counters.unattributed[&Link::plain(0)].bytes.rx,
+            (MAX_DEFERRED as u64 + 17) * 128
+        );
+        assert!(link_in_scope(Link::plain(0), None));
+        assert!(
+            !link_in_scope(Link::plain(0), Some(1)),
+            "foreign namespace lo must not select host lo"
         );
     }
 

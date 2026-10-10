@@ -134,7 +134,8 @@ lifetime for packets queued before receive. Conflicting actors, event losses and
 clock uncertainty suppress ownership. Competing bound UDP sockets veto inferred
 receive lifetimes even if they never report a peer. A unique open event candidate
 outside its syscall window requires corroboration by a current descriptor with
-the same inode and process identity, plus proven conntrack endpoints.
+the same inode and process identity, plus proven conntrack endpoints for pcap
+observations or the actual socket identity from endpoint packet capture.
 This is not proof of exclusive descriptor
 ownership; inventory evidence of sharing vetoes event matches.
 
@@ -148,19 +149,38 @@ Its worker alone retains NET_ADMIN.
 `/proc/PID/net` reads, verifying namespace identity before and after, without
 setns or SYS_ADMIN. `links.rs` identifies actual veth devices through rtnetlink.
 
-`extended.rs` combines independent endpoint evidence, translating sender and
-receiver against conntrack's original/reply tuples. Unproven raw endpoints never
-fall back to an unrelated sampled host listener. Equal SO_REUSEPORT owners credit
-only the process. Foreign endpoints contribute to All at the host veth boundary;
-selected-interface accounting retains other observations. Container loopback and
-non-veth namespace paths remain capture boundaries. Pending packets wait at most
-two seconds; known and unknown directions are recorded once. Capture begins
-before the initial descriptor scan. Packet realtime timestamps are mapped to the
-BPF monotonic clock, with quarantine after detected wall-clock steps.
-Untracked/NOTRACK flows can lack queued receive attribution on long-lived sockets;
-missing confirmed conntrack entries are reported per interval. A completed dump
-cannot prove absence of NAT for a packet still unconfirmed before PREROUTING, so
-the collector never converts a missing mapping into a guessed unchanged tuple.
+`extended.rs` combines independent endpoint evidence. Five additional hooks
+capture TCP/UDP IP skbs at `ip_finish_output2`, `ip6_finish_output2`, the mutually
+exclusive TCP established/state receive paths, and `__udp_enqueue_schedule_skb`.
+The 80-byte packet ABI carries socket incarnation, namespace, inode, direction,
+observed IP byte length and fixed header endpoints; no payload or kernel address.
+All TCP/UDP process bytes come only from these observations (`Link` index zero),
+including foreign loopback and non-veth devices. Namespace-local ifindexes never
+select host interfaces. TX counts the observed post-routing skb before neighbor
+delivery; RX counts the actual demultiplexed skb. GSO/GRO and fragmentation are
+not expanded into guessed wire segments. Pure forwarding requires a selected
+host interface; non-TCP/UDP host captures still contribute unknown All bytes.
+
+Host pcap observations remain available on selected interfaces and are marked
+excluded from All while endpoint capture is active. Their sender/receiver
+correlation uses conntrack original/reply tuples; unproven endpoints never fall
+back to an unrelated host listener. Missing conntrack can still leave selected
+interface traffic unknown. Neither a completed dump nor identical header
+fingerprints prove absence of NAT for packets delayed before PREROUTING.
+
+Each capture path has a bounded 4096-entry attribution wait queue and waits at
+most two seconds. At capacity, already proven endpoints remain credited and
+unresolved bytes become unknown. The 16384-entry pcap queue wakes attribution at
+one-quarter capacity using one coalesced notification. Capture and attribution
+pressure have distinct notices; limits are unchanged. Capture starts before the
+initial descriptor scan. Pcap realtime-to-monotonic uncertainty quarantines pcap
+ownership; endpoint timestamps already use the kernel monotonic clock.
+
+All hooks are armed together after attach. Runtime fatal errors keep the chosen
+All source sticky and mark process rates unavailable rather than switching to
+pcap and risking duplicate bytes. A failed socket-identity deletion disarms
+recording and requires restart, preventing kernel pointer reuse from reviving an
+old incarnation. Scoped links are destroyed on exit; nothing is pinned.
 
 Both installer scripts require `--extended-attribution` to opt in. Standard
 builds do not require clang/libbpf or extra capabilities. Runtime status exposes

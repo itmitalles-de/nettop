@@ -65,7 +65,7 @@ _Static_assert(sizeof(struct lifecycle_event) == 112, "lifecycle event ABI");
 struct statistics {
     __u64 lost_events, pending_failures, socket_failures, read_failures;
     __u64 nested_calls, nested_last_age_ns, nested_last_depth, nested_kind_mask;
-    __u64 pending_delete_failures;
+    __u64 pending_delete_failures, fatal_socket_reuse;
 };
 struct pending_key { __u64 tid; __u32 kind; __u32 pad; };
 struct call_state { __u64 started_ns; __u8 peer[28]; __u32 peer_len, depth, nested; };
@@ -366,13 +366,30 @@ int socket_birth(void *ctx)
     return 0;
 }
 
+// A failed final deletion could associate a recycled kernel pointer with an
+// old incarnation. Permanently disarm this object, rather than time out the
+// uncertainty and later resurrect that identity. A new object is required.
+static __always_inline void forget_socket(struct sock *sk, int final)
+{
+    __u64 key = (__u64)sk;
+    long result = bpf_map_delete_elem(&socket_ids, &key);
+    if (!result || result == -2) return; // ENOENT: never observed/already removed.
+    failure(2);
+    if (final) {
+        __u32 zero = 0;
+        __u32 *enabled = bpf_map_lookup_elem(&armed, &zero);
+        if (enabled) *enabled = 0;
+        struct statistics *s = bpf_map_lookup_elem(&stats, &zero);
+        if (s) __sync_fetch_and_add(&s->fatal_socket_reuse, 1);
+    }
+}
+
 // Unaccepted TCP children never receive inet_release. Remove their opaque ID
 // at actual final destruction, without creating another ID or naming a task.
 SEC("fentry/__sk_free")
 int BPF_PROG(socket_freed, struct sock *sk)
 {
-    __u64 key = (__u64)sk;
-    bpf_map_delete_elem(&socket_ids, &key);
+    forget_socket(sk, 1);
     return 0;
 }
 
@@ -383,9 +400,120 @@ int BPF_PROG(socket_close, struct socket *sock)
     if (!sk || !supported(sk)) return 0;
     struct call_state state = { .started_ns = bpf_ktime_get_ns() };
     emit(sk, sock, &state, CLOSE);
-    __u64 key = (__u64)sk;
-    bpf_map_delete_elem(&socket_ids, &key);
+    forget_socket(sk, 0);
     return 0;
 }
+
+// Canonical endpoint capture: IP skbs, never syscall byte totals or payload.
+struct net_device { int ifindex; } __attribute__((preserve_access_index));
+struct sk_buff {
+    struct net_device *dev;
+    unsigned int len;
+    unsigned char *head, *data;
+    __u16 network_header, transport_header;
+} __attribute__((preserve_access_index));
+struct packet_event {
+    __u64 timestamp_ns, socket_id, inode;
+    __u32 netns, ifindex, ip_bytes;
+    __u16 family, protocol, local_port, remote_port;
+    __u8 receive, flags;
+    __u16 reserved;
+    __u8 local_addr[16], remote_addr[16];
+};
+_Static_assert(sizeof(struct packet_event) == 80, "packet event ABI");
+static __always_inline __u16 packet_u16(const __u8 *p)
+{ return ((__u16)p[0] << 8) | p[1]; }
+
+static __always_inline int packet_observed(struct sock *sk, struct sk_buff *skb, __u8 receive)
+{
+    if (!ready() || !sk || !skb || !supported(sk)) return 0;
+    unsigned char *head = BPF_CORE_READ(skb, head);
+    unsigned char *data = BPF_CORE_READ(skb, data);
+    __u16 network = BPF_CORE_READ(skb, network_header);
+    __u16 transport = BPF_CORE_READ(skb, transport_header);
+    __u32 length = BPF_CORE_READ(skb, len);
+    __u64 start = (__u64)head + network;
+    // RX has already pulled IP (and sometimes transport) headers. Add only
+    // those actual skb bytes back; no inferred GSO segment/wire overhead.
+    if (!head || (__u64)data < start || (__u64)data - start > 4096 || !length)
+        return 0;
+    __u64 ip_bytes = length + ((__u64)data - start);
+    if (ip_bytes > 0xffffffffULL || ip_bytes < 20) return 0;
+    __u8 version = 0;
+    if (bpf_probe_read_kernel(&version, 1, (void *)start)) { failure(3); return 0; }
+    version >>= 4;
+    if (version != 4 && version != 6) return 0;
+    __u8 ip[40] = {};
+    if (version == 4) {
+        if (bpf_probe_read_kernel(ip, 20, (void *)start)) { failure(3); return 0; }
+    } else {
+        if (ip_bytes < 40) return 0;
+        if (bpf_probe_read_kernel(ip, 40, (void *)start)) { failure(3); return 0; }
+    }
+    __u64 id = incarnation(sk);
+    if (!id) return 0;
+    struct packet_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) { failure(0); return 0; }
+    __builtin_memset(e, 0, sizeof(*e));
+    e->timestamp_ns = bpf_ktime_get_ns();
+    e->socket_id = id;
+    e->inode = BPF_CORE_READ(sk, sk_socket, file, f_inode, i_ino);
+    e->netns = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+    e->ifindex = BPF_CORE_READ(skb, dev, ifindex);
+    e->ip_bytes = ip_bytes;
+    e->family = version == 4 ? AF_INET : AF_INET6;
+    e->protocol = BPF_CORE_READ(sk, sk_protocol);
+    e->receive = receive;
+    if (version == 4) {
+        __builtin_memcpy(e->local_addr, ip + (receive ? 16 : 12), 4);
+        __builtin_memcpy(e->remote_addr, ip + (receive ? 12 : 16), 4);
+        if (packet_u16(ip + 6) & 0x3fff) e->flags |= 2;
+    } else {
+        __builtin_memcpy(e->local_addr, ip + (receive ? 24 : 8), 16);
+        __builtin_memcpy(e->remote_addr, ip + (receive ? 8 : 24), 16);
+    }
+    // Export ports only when the transport header is unambiguously present.
+    // No transport fingerprint is treated as packet identity: matching headers
+    // can belong to unrelated packets in other namespaces or before DNAT.
+    __u16 network_len = version == 4 ? (ip[0] & 15) * 4 : 40;
+    __u8 proto = version == 4 ? ip[9] : ip[6];
+    if (!(e->flags & 2) && proto == e->protocol && network_len >= 20 &&
+        transport >= network && transport - network == network_len &&
+        ip_bytes >= (__u32)network_len + (proto == IPPROTO_TCP ? 20 : 8)) {
+        __u8 ports[4] = {};
+        if (bpf_probe_read_kernel(ports, 4, head + transport)) {
+            failure(3);
+            bpf_ringbuf_discard(e, 0);
+            return 0;
+        }
+        e->local_port = packet_u16(ports + (receive ? 2 : 0));
+        e->remote_port = packet_u16(ports + (receive ? 0 : 2));
+        e->flags |= 1;
+    }
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// This common finish stage runs after POST_ROUTING and any software
+// fragmentation/GSO splitting. Hardware-offloaded GSO remains one IP skb.
+SEC("fentry/ip_finish_output2")
+int BPF_PROG(packet_tx4, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return packet_observed(sk, skb, 0); }
+SEC("fentry/ip6_finish_output2")
+int BPF_PROG(packet_tx6, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return packet_observed(sk, skb, 0); }
+// The TCP state machine dispatches ESTABLISHED here and all other ordinary
+// states to state_process, including a newly accepted child; never hook both
+// the outer family dispatcher and these inner functions.
+SEC("fentry/tcp_rcv_established")
+int BPF_PROG(packet_tcp_established, struct sock *sk, struct sk_buff *skb)
+{ return packet_observed(sk, skb, 1); }
+SEC("fentry/tcp_rcv_state_process")
+int BPF_PROG(packet_tcp_state, struct sock *sk, struct sk_buff *skb)
+{ return packet_observed(sk, skb, 1); }
+// Both UDP families reach this common queue boundary after demultiplexing.
+SEC("fentry/__udp_enqueue_schedule_skb")
+int BPF_PROG(packet_udp_receive, struct sock *sk, struct sk_buff *skb)
+{ return packet_observed(sk, skb, 1); }
 
 char LICENSE[] SEC("license") = "GPL";

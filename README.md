@@ -152,25 +152,37 @@ can be delayed by up to two seconds while late events arrive. Ambiguous owners,
 shared descriptors, event loss and unsupported asynchronous I/O may still leave
 traffic unattributed. This is monitoring, not complete per-process accounting.
 
-**Conntrack must actually track the flows** for sampled socket evidence to
-supplement events. Merely loading its module or opening netlink does not enable
-tracking. With untracked/NOTRACK traffic, queued receive data on long-lived
-sockets, and packets sent after their syscall window, can remain unattributed
-even when the process is visible; capture status
-reports missing confirmed conntrack entries. nettop does not change firewall
-rules to enable tracking. The standard build's sampled mode remains available.
-Further work is tracked in [#8](https://github.com/itmitalles-de/nettop/issues/8).
+In **All**, extended mode captures actual TCP/UDP IP packets at socket endpoints
+across network namespaces, including foreign loopback, macvlan and ipvlan paths.
+Each send/receive direction is counted at one endpoint capture point; bridge,
+veth and VLAN copies do not multiply its bytes. A packet's kernel socket identity
+supplies positive evidence even without conntrack, including queued receives on
+long-lived NOTRACK sockets. Current descriptor evidence and ambiguity checks
+still apply. A uniquely observed reader may receive credit after a descriptor
+transfer; this does not claim historical ownership when the packet arrived.
+Connection rows use the endpoints actually present in the captured packet;
+packets without complete transport ports contribute only to process totals.
 
-The extended mode discovers accessible network namespaces without entering them.
-Conntrack translates published-port DNAT and SNAT endpoints; conflicting NAT
-zones remain unattributed. In All, container traffic is counted at the host veth
-boundary once per process direction. Container-internal loopback traffic is not
-visible to host capture, and macvlan/ipvlan paths without that boundary are not
-included in All process totals. A selected visible interface can still show
-attribution. Namespace discovery, queues and event history are bounded.
-Additional namespace capture paths are tracked in
-[#9](https://github.com/itmitalles-de/nettop/issues/9), and further live kernel
-coverage in [#10](https://github.com/itmitalles-de/nettop/issues/10).
+These are observed IP skb bytes, not syscall payload counts or reconstructed
+wire frames. Segmentation, receive aggregation, fragmentation and packets later
+dropped after the capture point can make them differ from interface counters.
+Pure forwarding has no local socket endpoint: select a host interface to inspect
+its captured bytes. Non-TCP/UDP host captures remain unattributed in All.
+
+A **selected interface** continues to use host libpcap with conservative socket
+and conntrack correlation. Untracked queued traffic can remain unattributed in
+that view; an absent mapping never proves absence of NAT. Identical packet
+headers are not used to guess a socket across namespaces. Foreign loopback does
+not appear under the host's loopback interface. Interface graphs always use the
+host kernel counters, so their scope differs from cross-namespace process totals.
+nettop neither enters namespaces nor changes firewall rules.
+
+All packet hooks attach together or startup retains the existing capture path
+with an explanation. A fatal runtime packet-backend failure makes All process
+rates unavailable until restart, avoiding a switch that could double-count bytes.
+Queues and history remain bounded. Capture-buffer pressure and attribution-wait
+pressure have separate notices; the latter preserves already captured bytes and
+any proven endpoint while ending the wait for remaining evidence.
 
 ## Use
 
@@ -327,6 +339,15 @@ separation, unprivileged cross-user attribution, installer safeguards, bounded
 protocol input, shutdown with a stopped helper, helper cleanup when the
 terminal closes, and the fallback to direct counters when the helper stops
 answering.
+
+The optional backend's kernel tests run only in an owned disposable QEMU/KVM
+guest. `tests/namespaces.py` covers 46 TCP/UDP namespace, NAT and NOTRACK cases,
+including a competing pre-DNAT listener and separate All/selected-interface
+assertions. [Adversarial test instructions](tests/adversarial.md) cover descriptor
+sharing, io_uring, Fast Open, retransmission, metadata loss, clock changes and
+tuple reuse. `tests/pressure.py` checks both capture scopes under bounded UDP
+loads, including minimum captured bytes, duplicate totals and resident memory.
+Keep raw process/packet evidence outside the repository.
 
 [CI](.github/workflows/ci.yml) is configured to run formatting, linting, unit
 tests on stable and Rust 1.88.0, release builds, terminal restoration, prompt exits after the terminal closes, Setup and
