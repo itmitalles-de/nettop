@@ -16,6 +16,12 @@ helper falls back to direct unprivileged collection instead of exiting.
 UI colors use native ANSI colors and inverse styles, inheriting the terminal theme.
 `shutdown.rs` registers cooperative SIGINT/SIGTERM/SIGHUP handlers so raw mode,
 the alternate screen and the cursor are restored even with long refresh periods.
+`input.rs` reads crossterm events on a `nettop-input` thread, because crossterm's
+reader retries end-of-file/EIO from a hung-up terminal forever inside
+`event::poll`/`read`. The event loop waits on that channel in 100 ms steps and
+also exits (code 0, like SIGHUP) when stdin reports POLLHUP/POLLERR, which covers
+closed terminals that send no SIGHUP to non-session-leaders. Final restore errors
+are written without `eprintln!`, which would panic on a dead stderr.
 
 Normal-user capture uses the optional root-owned, group-restricted
 `/usr/local/libexec/nettop-collector`, which clears its whole environment before

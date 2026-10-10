@@ -36,6 +36,11 @@
   unavailable saved interfaces and malformed settings. Terminal restoration
   checks pass for q, SIGTERM, SIGINT and SIGHUP. New UI/preferences changes were
   independently reviewed; unavailable rates remain visible when idle rows are hidden.
+- Closed-terminal hang fix (branch `fix/tty-hangup`, 2026-10-10): a closed PTY
+  master previously left nettop spinning in crossterm's EOF read loop (~60 % CPU)
+  and deaf to SIGHUP. `tests/terminal.py` now checks a closed terminal without
+  SIGHUP, SIGHUP after closing and a closed controlling terminal (exit 0 within
+  2 s); `tests/helper.py` checks that the helper is reaped in both hang-up cases.
 - Real separate-PID TCP/UDP capture tests passed for IPv4 and IPv6 in an isolated
   Ubuntu 26.04 Docker container, including IPv4 to a dual-stack UDP listener; no
   loopback double counting. CI uses Ubuntu 24.04. See `tests/live_capture.py`.

@@ -254,11 +254,12 @@ sender and receiver PIDs exchange real IPv4/IPv6 TCP and UDP traffic; assertions
 cover measured rates, PID attribution, packet drops, and duplicate counting
 without changing network configuration. `tests/helper.py` also checks capability
 separation, unprivileged cross-user attribution, installer safeguards, bounded
-protocol input, shutdown with a stopped helper, and the fallback to direct
-counters when the helper stops answering.
+protocol input, shutdown with a stopped helper, helper cleanup when the
+terminal closes, and the fallback to direct counters when the helper stops
+answering.
 
 [CI](.github/workflows/ci.yml) is configured to run formatting, linting, unit
-tests on stable and Rust 1.88.0, release builds, terminal restoration, Setup and
+tests on stable and Rust 1.88.0, release builds, terminal restoration, prompt exits after the terminal closes, Setup and
 persistence checks, a dependency audit, and capture tests in isolated, digest-pinned
 Ubuntu 24.04 containers.
 Building the test image needs access to its base image and package repositories.

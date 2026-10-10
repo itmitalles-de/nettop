@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Check terminal restoration after keyboard, signal and error exits, and
-clean non-interactive output into a closed pipe.
+"""Check terminal restoration after keyboard, signal and error exits, prompt
+exits after the terminal is closed, and clean non-interactive output into a
+closed pipe.
 
 Run without root: python3 tests/terminal.py target/release/nettop
 Each case owns a fresh pseudo-terminal and affects no interactive terminal.
@@ -135,6 +136,62 @@ def run_error_case(binary):
                 os.close(descriptor)
 
 
+def controlling_terminal():
+    """Make the new session's standard input its controlling terminal."""
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def run_hangup_case(binary, label, controlling=False, sighup=False):
+    """Closing the terminal ends the monitor promptly, without a CPU spin.
+
+    A closed pseudo-terminal master hangs up the terminal: reads return end of
+    file and writes fail. Only a session leader whose controlling terminal it is
+    receives SIGHUP from the kernel; other processes must notice the hang-up.
+    """
+    master, slave = pty.openpty()
+    child = None
+    output = bytearray()
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
+        child = subprocess.Popen(
+            [str(binary), "--demo", "--interval", "60"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=environment(),
+            start_new_session=True,
+            preexec_fn=controlling_terminal if controlling else None,
+        )
+        deadline = time.monotonic() + 5
+        while b"Device" not in output or b"\x1b[?1049h" not in output:
+            assert child.poll() is None, f"{label}: monitor exited during startup: {output!r}"
+            assert time.monotonic() < deadline, f"{label}: monitor did not draw: {output!r}"
+            read_available(master, output, 0.05)
+        tty_nr = int(Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[4])
+        assert (tty_nr != 0) == controlling, f"{label}: unexpected controlling terminal {tty_nr}"
+        os.close(master)
+        master = None
+        if sighup:
+            child.send_signal(signal.SIGHUP)
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            cpu = Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()
+            raise AssertionError(
+                f"{label}: still running 2 s after the terminal closed "
+                f"(utime {cpu[11]}, stime {cpu[12]} ticks)"
+            ) from None
+        assert child.returncode == 0, f"{label}: unexpected exit code {child.returncode}"
+        print(f"PASS {label}: exited cleanly within two seconds")
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+        for descriptor in (master, slave):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
 def run_closed_pipe_case(binary):
     """A reader that closes the pipe early must not cause a panic."""
     for mode in ("--json", "--once"):
@@ -163,6 +220,9 @@ def main():
     for exit_signal in (None, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_case(binary, exit_signal)
     run_error_case(binary)
+    run_hangup_case(binary, "closed terminal without SIGHUP")
+    run_hangup_case(binary, "SIGHUP after the terminal closed", sighup=True)
+    run_hangup_case(binary, "closed controlling terminal", controlling=True)
     run_closed_pipe_case(binary)
     print("All terminal restoration checks passed.")
 

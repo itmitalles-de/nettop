@@ -2,6 +2,7 @@ pub mod collector;
 pub mod config;
 pub mod helper;
 pub mod i18n;
+pub mod input;
 pub mod model;
 pub mod privilege;
 pub mod shutdown;
