@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded packet-load regression; run only in an owned QEMU/KVM guest.
 
+Keep the guest otherwise idle; All allows 64 KiB of incidental guest traffic.
 Use --baseline to collect comparable evidence from an older binary. No firewall,
 clock, namespace or host configuration changes are made by this test.
 """
@@ -16,10 +17,10 @@ import time
 from extended import wait_capture
 
 
-def run(args, count):
+def run(args, count, scope):
     with tempfile.TemporaryDirectory(prefix="nettop-pressure-") as config:
         monitor = subprocess.Popen(
-            [str(args.binary), "--json", "--interface", "lo", "--interval", "8"],
+            [str(args.binary), "--json", "--interface", scope, "--interval", "8"],
             env=dict(os.environ, XDG_CONFIG_HOME=config, LANG="C"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         peak_rss = 0
@@ -52,20 +53,27 @@ def run(args, count):
                 credited = own.get(direction + "_bytes", 0)
                 assert credited <= expected, (direction, credited, expected, "duplicate bytes")
                 accounted = sum(row[direction + "_bytes"] for row in snapshot["processes"])
-                assert accounted <= expected + 4096, (direction, accounted, expected, "duplicate total")
-                if not capture["dropped"]:
-                    assert accounted >= expected * .9, (direction, accounted, expected, "missing bytes")
+                background_budget = 4096 if scope == "lo" else 64 * 1024
+                assert accounted <= expected + background_budget, (direction, accounted, expected, "duplicate total or busy guest")
+                # A reported drop never excuses an empty result. The moderate
+                # case requires nearly complete accounting; bursts have a
+                # fixed loss budget, including unknown bytes.
+                minimum = .98 if count <= 4096 else .80
+                assert accounted >= expected * minimum, (scope, direction, accounted, expected, "missing bytes")
             assert peak_rss < 256 * 1024, ("unbounded resident memory", peak_rss)
             if not args.baseline:
                 assert all(n["code"] != "flow_limit" for n in notes), "ambiguous legacy pressure notice"
-            record = dict(packets=count, ip_bytes_each_direction=expected,
+                assert capture["dropped"] <= count * .4, ("capture loss budget exceeded", capture)
+                if scope == "all":
+                    assert any(n["code"] == "all_socket_packets" for n in notes), "socket packet backend missing"
+            record = dict(scope=scope, packets=count, ip_bytes_each_direction=expected,
                           seconds=duration, packets_per_second=count / duration,
                           peak_rss_kib=peak_rss, capture=capture,
                           total_rx_bytes=sum(r["rx_bytes"] for r in snapshot["processes"]),
                           total_tx_bytes=sum(r["tx_bytes"] for r in snapshot["processes"]),
                           rx_bytes=own.get("rx_bytes", 0), tx_bytes=own.get("tx_bytes", 0))
             args.output.mkdir(parents=True, exist_ok=True)
-            (args.output / f"pressure-{count}.json").write_text(json.dumps(record, indent=2) + "\n")
+            (args.output / f"pressure-{scope}-{count}.json").write_text(json.dumps(record, indent=2) + "\n")
             print(json.dumps(record), flush=True)
         finally:
             if monitor.poll() is None:
@@ -84,14 +92,19 @@ def main():
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--counts", type=int, nargs="+", default=[4096, 20000, 80000])
+    parser.add_argument("--scopes", choices=["lo", "all"], nargs="+", default=["lo", "all"])
     args = parser.parse_args()
-    assert os.geteuid() == 0
+    if os.geteuid() != 0:
+        raise SystemExit("guest root is required")
     virt = subprocess.run(["systemd-detect-virt", "--vm"], capture_output=True, text=True)
-    assert virt.returncode == 0 and virt.stdout.strip() in {"qemu", "kvm"}, "dedicated VM required"
+    if virt.returncode != 0 or virt.stdout.strip() not in {"qemu", "kvm"}:
+        raise SystemExit("dedicated QEMU/KVM guest required")
     args.binary = args.binary.resolve(strict=True)
-    for count in args.counts:
-        assert 0 < count <= 200000
-        run(args, count)
+    for scope in args.scopes:
+        for count in args.counts:
+            if not 0 < count <= 200000:
+                raise SystemExit("packet counts must be between 1 and 200000")
+            run(args, count, scope)
 
 
 if __name__ == "__main__":

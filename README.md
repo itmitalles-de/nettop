@@ -160,6 +160,8 @@ supplies positive evidence even without conntrack, including queued receives on
 long-lived NOTRACK sockets. Current descriptor evidence and ambiguity checks
 still apply. A uniquely observed reader may receive credit after a descriptor
 transfer; this does not claim historical ownership when the packet arrived.
+Connection rows use the endpoints actually present in the captured packet;
+packets without complete transport ports contribute only to process totals.
 
 These are observed IP skb bytes, not syscall payload counts or reconstructed
 wire frames. Segmentation, receive aggregation, fragmentation and packets later
@@ -337,6 +339,15 @@ separation, unprivileged cross-user attribution, installer safeguards, bounded
 protocol input, shutdown with a stopped helper, helper cleanup when the
 terminal closes, and the fallback to direct counters when the helper stops
 answering.
+
+The optional backend's kernel tests run only in an owned disposable QEMU/KVM
+guest. `tests/namespaces.py` covers 46 TCP/UDP namespace, NAT and NOTRACK cases,
+including a competing pre-DNAT listener and separate All/selected-interface
+assertions. [Adversarial test instructions](tests/adversarial.md) cover descriptor
+sharing, io_uring, Fast Open, retransmission, metadata loss, clock changes and
+tuple reuse. `tests/pressure.py` checks both capture scopes under bounded UDP
+loads, including minimum captured bytes, duplicate totals and resident memory.
+Keep raw process/packet evidence outside the repository.
 
 [CI](.github/workflows/ci.yml) is configured to run formatting, linting, unit
 tests on stable and Rust 1.88.0, release builds, terminal restoration, prompt exits after the terminal closes, Setup and
