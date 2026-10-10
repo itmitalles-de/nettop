@@ -45,10 +45,29 @@ pub(super) struct Flow {
     pub direction: Direction,
 }
 
+/// Identifies the fragments of one IP datagram. Only the first fragment carries
+/// transport ports; later fragments borrow them through a short-lived cache.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct FragmentKey {
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub id: u32,
+    pub protocol: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Fragment {
+    /// Offset zero with more fragments following; ports are present.
+    First(FragmentKey),
+    /// A nonzero offset; transport ports are not part of this packet.
+    Later(FragmentKey),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Packet {
     pub flow: Flow,
     pub bytes: u64,
+    pub fragment: Option<Fragment>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +131,8 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
         offset += 4;
     }
     let ip = data.get(offset..).ok_or(ParseError::Truncated)?;
+    // (first fragment, identification, protocol of the fragmented payload)
+    let mut fragment: Option<(bool, u32, u8)> = None;
     let (source, destination, protocol, transport_offset, ports_present, bytes) = match ethertype {
         0x0800 => {
             let header = ip.get(..20).ok_or(ParseError::Truncated)?;
@@ -123,9 +144,16 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
                 return Err(ParseError::Invalid);
             }
             ip.get(..header_length).ok_or(ParseError::Truncated)?;
-            let length = u16_at(header, 2)? as usize;
-            if length < header_length || length > wire_length.saturating_sub(offset as u32) as usize
-            {
+            let total_length = u16_at(header, 2)? as usize;
+            let available = wire_length.saturating_sub(offset as u32) as usize;
+            // Linux BIG TCP/GSO exposes IPv4 super-packets above 64 KiB with a
+            // zero total length, like IPv6 jumbo frames with payload length 0.
+            let length = if total_length == 0 && available > 65_535 {
+                available
+            } else {
+                total_length
+            };
+            if length < header_length || length > available {
                 return Err(ParseError::Invalid);
             }
             let source = IpAddr::V4(Ipv4Addr::new(
@@ -134,7 +162,11 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
             let destination = IpAddr::V4(Ipv4Addr::new(
                 header[16], header[17], header[18], header[19],
             ));
-            let first_fragment = u16_at(header, 6)? & 0x1fff == 0;
+            let flags_offset = u16_at(header, 6)?;
+            let first_fragment = flags_offset & 0x1fff == 0;
+            if !first_fragment || flags_offset & 0x2000 != 0 {
+                fragment = Some((first_fragment, u32::from(u16_at(header, 4)?), header[9]));
+            }
             (
                 source,
                 destination,
@@ -175,7 +207,19 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
                     }
                     51 => (*ip.get(cursor + 1).ok_or(ParseError::Truncated)? as usize + 2) * 4,
                     44 => {
-                        first_fragment = u16_at(ip, cursor + 2)? & 0xfff8 == 0;
+                        let offset_flags = u16_at(ip, cursor + 2)?;
+                        first_fragment = offset_flags & 0xfff8 == 0;
+                        let id = ip
+                            .get(cursor + 4..cursor + 8)
+                            .ok_or(ParseError::Truncated)?;
+                        // Atomic fragments (offset 0, no M flag) need no cache.
+                        if !first_fragment || offset_flags & 1 != 0 {
+                            fragment = Some((
+                                first_fragment,
+                                u32::from_be_bytes(id.try_into().unwrap()),
+                                ip[cursor],
+                            ));
+                        }
                         8
                     }
                     _ => break,
@@ -213,6 +257,19 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
         } else {
             (None, None)
         };
+    let fragment = fragment.and_then(|(first, id, fragment_protocol)| {
+        let key = FragmentKey {
+            source,
+            destination,
+            id,
+            protocol: fragment_protocol,
+        };
+        if !first {
+            Some(Fragment::Later(key))
+        } else {
+            source_port.map(|_| Fragment::First(key))
+        }
+    });
     Ok(Packet {
         flow: Flow {
             source,
@@ -224,6 +281,7 @@ pub(super) fn parse(data: &[u8], wire_length: u32, datalink: i32) -> Result<Pack
             direction,
         },
         bytes,
+        fragment,
     })
 }
 
@@ -261,10 +319,63 @@ mod tests {
     fn noninitial_fragment_keeps_bytes_without_inventing_ports() {
         let mut data = ipv4(17);
         data[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        data[4..6].copy_from_slice(&0x1234_u16.to_be_bytes());
         let parsed = parse(&data, 28, 101).unwrap();
         assert_eq!(parsed.flow.source_port, None);
         assert_eq!(parsed.flow.protocol, Protocol::Udp);
         assert_eq!(parsed.bytes, 28);
+        let later = FragmentKey {
+            source: "192.0.2.1".parse().unwrap(),
+            destination: "198.51.100.2".parse().unwrap(),
+            id: 0x1234,
+            protocol: 17,
+        };
+        assert_eq!(parsed.fragment, Some(Fragment::Later(later)));
+        // The first fragment (offset 0, MF set) carries the ports to remember.
+        data[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+        let first = parse(&data, 28, 101).unwrap();
+        assert_eq!(first.flow.destination_port, Some(443));
+        assert_eq!(first.fragment, Some(Fragment::First(later)));
+        // Unfragmented datagrams carry no fragment state.
+        data[6..8].copy_from_slice(&0x4000_u16.to_be_bytes());
+        assert_eq!(parse(&data, 28, 101).unwrap().fragment, None);
+    }
+
+    #[test]
+    fn ipv6_fragments_expose_identification() {
+        let mut data = vec![0; 56];
+        data[0] = 0x60;
+        data[4..6].copy_from_slice(&16_u16.to_be_bytes());
+        data[6] = 44;
+        data[23] = 1;
+        data[39] = 2;
+        data[40] = 17;
+        data[42..44].copy_from_slice(&1_u16.to_be_bytes()); // offset 0, M flag
+        data[44..48].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        data[48..50].copy_from_slice(&123_u16.to_be_bytes());
+        data[50..52].copy_from_slice(&456_u16.to_be_bytes());
+        let first = parse(&data, 56, 101).unwrap();
+        assert_eq!(first.flow.source_port, Some(123));
+        let Some(Fragment::First(key)) = first.fragment else {
+            panic!("first fragment not recognized: {:?}", first.fragment);
+        };
+        assert_eq!((key.id, key.protocol), (0xdead_beef, 17));
+        data[42..44].copy_from_slice(&(8_u16 << 3).to_be_bytes());
+        let later = parse(&data, 56, 101).unwrap();
+        assert_eq!(later.flow.source_port, None);
+        assert_eq!(later.flow.protocol, Protocol::Udp);
+        assert_eq!(later.fragment, Some(Fragment::Later(key)));
+    }
+
+    #[test]
+    fn ipv4_big_tcp_uses_wire_length_for_zero_total_length() {
+        let mut data = ipv4(6);
+        data[2..4].copy_from_slice(&0_u16.to_be_bytes());
+        let parsed = parse(&data, 100_000, 101).unwrap();
+        assert_eq!(parsed.bytes, 100_000);
+        assert_eq!(parsed.flow.destination_port, Some(443));
+        // A zero length below the 64 KiB limit remains malformed.
+        assert_eq!(parse(&data, 60_000, 101).unwrap_err(), ParseError::Invalid);
     }
 
     #[test]

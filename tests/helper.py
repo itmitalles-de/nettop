@@ -68,7 +68,7 @@ def check_capabilities(monitor, account):
 
     def privileges_dropped():
         states = [status(helper_pid, tid.name) for tid in Path(f"/proc/{helper_pid}/task").iterdir()]
-        return len(states) >= 2 and all(int(state["NoNewPrivs"]) == 1 for state in states)
+        return len(states) >= 3 and all(int(state["NoNewPrivs"]) == 1 for state in states)
 
     wait_until(privileges_dropped, "per-thread privilege drop")
     ui = status(monitor.pid)
@@ -77,7 +77,10 @@ def check_capabilities(monitor, account):
         assert int(ui[field], 16) == 0, f"UI retained {field}: {ui[field]}"
     for task in Path(f"/proc/{helper_pid}/task").iterdir():
         state = status(helper_pid, task.name)
-        expected = READ_CAPS if int(task.name) == helper_pid else 0
+        # The main sampling thread and the background socket attribution
+        # thread read /proc; the capture worker keeps no capabilities.
+        comm = Path(f"/proc/{helper_pid}/task/{task.name}/comm").read_text().strip()
+        expected = READ_CAPS if int(task.name) == helper_pid or comm == "nettop-attrib" else 0
         assert all(int(value) == account.pw_uid for value in state["Uid"].split()), "Helper changed UID"
         assert int(state["CapEff"], 16) == expected, f"Wrong effective capabilities: {state['CapEff']}"
         assert int(state["CapPrm"], 16) == expected, f"Wrong permitted capabilities: {state['CapPrm']}"
@@ -220,7 +223,7 @@ def check_stopped_helper(binary, account, signal_exit=True):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "TERM": "xterm-256color"},
+            env={**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8"},
             start_new_session=True,
             **unprivileged(account),
         )
@@ -234,26 +237,37 @@ def check_stopped_helper(binary, account, signal_exit=True):
         stopped_at = time.monotonic()
         # The next sample is now waiting on a helper that cannot answer.
         time.sleep(0.25)
-        if signal_exit:
-            monitor.send_signal(signal.SIGTERM)
-        deadline = time.monotonic() + (3 if signal_exit else 13)
+        if not signal_exit:
+            # After the ten-second deadline the monitor keeps running on direct
+            # counters, reports the failure and stops and reaps the helper.
+            deadline = time.monotonic() + 13
+            while Path(f"/proc/{helper_pid}").exists():
+                assert monitor.poll() is None, f"Helper timeout ended the monitor: {output!r}"
+                assert time.monotonic() < deadline, "Stalled helper was not replaced"
+                read_terminal(master, output, 0.05)
+            assert time.monotonic() - stopped_at >= 9.5, "Helper response timed out prematurely"
+            deadline = time.monotonic() + 3
+            while b"timed out" not in output:
+                assert monitor.poll() is None, f"Monitor exited after fallback: {output!r}"
+                assert time.monotonic() < deadline, f"Missing timeout notice: {output!r}"
+                read_terminal(master, output, 0.05)
+            time.sleep(0.5)
+            assert monitor.poll() is None, f"Monitor exited after fallback: {output!r}"
+        monitor.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 3
         while monitor.poll() is None:
             assert time.monotonic() < deadline, "UI shutdown blocked on stopped helper"
             read_terminal(master, output, 0.05)
         while select.select([master], [], [], 0)[0]:
             read_terminal(master, output, 0)
-        expected_code = 0 if signal_exit else 1
-        assert monitor.returncode == expected_code, f"Unexpected exit code: {monitor.returncode}"
-        if not signal_exit:
-            assert time.monotonic() - stopped_at >= 9.5, "Helper response timed out prematurely"
-            assert b"capture helper timed out" in output, f"Missing timeout error: {output!r}"
+        assert monitor.returncode == 0, f"Unexpected exit code: {monitor.returncode}"
         assert termios.tcgetattr(slave) == before, "Terminal attributes were not restored"
         assert b"\x1b[?1049l" in output and b"\x1b[?25h" in output, "Screen/cursor were not restored"
         assert not Path(f"/proc/{helper_pid}").exists(), "Stopped helper survived UI shutdown"
         if signal_exit:
             print("PASS SIGTERM interrupts a blocked helper response, restores the terminal and reaps the helper")
         else:
-            print("PASS ten-second helper timeout restores the terminal on error and reaps the stopped helper")
+            print("PASS ten-second helper timeout shows a notice, falls back to direct counters and reaps the helper")
     finally:
         if helper_pid is not None and Path(f"/proc/{helper_pid}").exists():
             os.kill(helper_pid, signal.SIGKILL)
@@ -289,7 +303,7 @@ def check_abrupt_exit(binary, account):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "TERM": "xterm-256color"},
+            env={**os.environ, "TERM": "xterm-256color", "LC_ALL": "C.UTF-8"},
             start_new_session=True,
             **unprivileged(account),
         )

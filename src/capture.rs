@@ -1,6 +1,6 @@
 //! An owned, non-promiscuous libpcap session with bounded in-memory aggregation.
 
-use super::packet::{self, Direction, Flow, Packet};
+use super::packet::{self, Direction, Flow, Fragment, FragmentKey, Packet, Protocol};
 use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 use std::collections::HashMap;
@@ -8,11 +8,13 @@ use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SNAPLEN: i32 = 192;
 const MAX_FLOWS: usize = 16_384;
 const MAX_INTERFACES: usize = 256;
+const MAX_FRAGMENTED_DATAGRAMS: usize = 4_096;
+const FRAGMENT_LIFETIME: Duration = Duration::from_secs(2);
 
 #[repr(C)]
 struct PcapHeader {
@@ -22,7 +24,7 @@ struct PcapHeader {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct PcapStats {
     received: u32,
     dropped: u32,
@@ -176,6 +178,62 @@ pub(super) struct Untracked {
     pub packets: u64,
 }
 
+/// Remembers the ports of recently seen first fragments so later fragments of
+/// the same datagram can be attributed. Bounded in size and lifetime; only the
+/// header fields that identify the datagram and its ports are retained.
+#[derive(Default)]
+struct Fragments {
+    ports: HashMap<FragmentKey, (Protocol, u16, u16, Instant)>,
+}
+
+impl Fragments {
+    fn apply(&mut self, packet: &mut Packet, now: Instant) {
+        match packet.fragment {
+            Some(Fragment::First(key)) => {
+                let (Some(source), Some(destination)) =
+                    (packet.flow.source_port, packet.flow.destination_port)
+                else {
+                    return;
+                };
+                if self.ports.len() >= MAX_FRAGMENTED_DATAGRAMS && !self.ports.contains_key(&key) {
+                    self.expire(now);
+                }
+                if self.ports.len() < MAX_FRAGMENTED_DATAGRAMS || self.ports.contains_key(&key) {
+                    self.ports
+                        .insert(key, (packet.flow.protocol, source, destination, now));
+                }
+            }
+            Some(Fragment::Later(key)) => {
+                if let Some(&(protocol, source, destination, seen)) = self.ports.get(&key)
+                    && now.saturating_duration_since(seen) <= FRAGMENT_LIFETIME
+                {
+                    packet.flow.protocol = protocol;
+                    packet.flow.source_port = Some(source);
+                    packet.flow.destination_port = Some(destination);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.ports
+            .retain(|_, entry| now.saturating_duration_since(entry.3) <= FRAGMENT_LIFETIME);
+    }
+}
+
+/// pcap_stats reports cumulative 32-bit counters that wrap; only the change
+/// since the previous reading belongs to the current interval.
+fn dropped_since(previous: &PcapStats, current: &PcapStats) -> u64 {
+    u64::from(current.dropped.wrapping_sub(previous.dropped))
+        + u64::from(
+            current
+                .interface_dropped
+                .wrapping_sub(previous.interface_dropped),
+        )
+}
+
+/// Captured flows plus the capture problems observed since the previous drain.
 #[derive(Default)]
 pub(super) struct Batch {
     pub flows: HashMap<Flow, u64>,
@@ -240,7 +298,10 @@ impl Capture {
                 if sender.send(Ok(session.datalink == 276)).is_err() {
                     return;
                 }
-                let mut stats_at = std::time::Instant::now();
+                let mut stats_at = Instant::now();
+                let mut previous_stats = PcapStats::default();
+                let mut fragments = Fragments::default();
+                let mut fragments_expired_at = Instant::now();
                 while !thread_stop.load(Ordering::Relaxed) {
                     let mut packets = Vec::with_capacity(256);
                     let mut unsupported = 0_u64;
@@ -276,6 +337,14 @@ impl Capture {
                         }
                     }
                     let idle = packets.is_empty() && unsupported == 0 && truncated == 0;
+                    let now = Instant::now();
+                    for packet in &mut packets {
+                        fragments.apply(packet, now);
+                    }
+                    if now.saturating_duration_since(fragments_expired_at) >= FRAGMENT_LIFETIME {
+                        fragments.expire(now);
+                        fragments_expired_at = now;
+                    }
                     if let Ok(mut buffer) = thread_buffer.lock() {
                         for packet in packets {
                             buffer.push(packet);
@@ -285,10 +354,12 @@ impl Capture {
                         if stats_at.elapsed() >= Duration::from_secs(1) {
                             let mut stats = PcapStats::default();
                             if unsafe { (session.api.stats)(session.handle, &mut stats) } == 0 {
-                                buffer.dropped =
-                                    stats.dropped as u64 + stats.interface_dropped as u64;
+                                buffer.dropped = buffer
+                                    .dropped
+                                    .saturating_add(dropped_since(&previous_stats, &stats));
+                                previous_stats = stats;
                             }
-                            stats_at = std::time::Instant::now();
+                            stats_at = Instant::now();
                         }
                         if let Some(error) = failed.as_ref() {
                             buffer.error = Some(error.clone());
@@ -322,6 +393,8 @@ impl Capture {
         }
     }
 
+    /// Takes flows and problem counters observed since the previous drain, so
+    /// a startup burst does not keep reporting drops forever.
     pub(super) fn drain(&self) -> Batch {
         let Ok(mut buffer) = self.buffer.lock() else {
             return Batch {
@@ -332,10 +405,10 @@ impl Capture {
         Batch {
             flows: std::mem::take(&mut buffer.flows),
             untracked: std::mem::take(&mut buffer.untracked),
-            dropped: buffer.dropped,
-            overflow: buffer.overflow,
-            unsupported: buffer.unsupported,
-            truncated: buffer.truncated,
+            dropped: std::mem::take(&mut buffer.dropped),
+            overflow: std::mem::take(&mut buffer.overflow),
+            unsupported: std::mem::take(&mut buffer.unsupported),
+            truncated: std::mem::take(&mut buffer.truncated),
             error: buffer.error.clone(),
         }
     }
@@ -352,7 +425,6 @@ impl Drop for Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::super::packet::Protocol;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -371,6 +443,7 @@ mod tests {
                     direction: Direction::Outgoing,
                 },
                 bytes: 128,
+                fragment: None,
             });
         }
         assert_eq!(batch.flows.len(), MAX_FLOWS);
@@ -383,5 +456,66 @@ mod tests {
                 .bytes,
             128
         );
+    }
+
+    #[test]
+    fn pcap_drop_counters_report_wrapping_deltas() {
+        let stats = |dropped, interface_dropped| PcapStats {
+            received: 0,
+            dropped,
+            interface_dropped,
+        };
+        assert_eq!(dropped_since(&stats(0, 0), &stats(5, 2)), 7);
+        assert_eq!(dropped_since(&stats(5, 2), &stats(5, 2)), 0);
+        assert_eq!(dropped_since(&stats(u32::MAX - 1, 0), &stats(3, 0)), 5);
+    }
+
+    #[test]
+    fn later_fragments_reuse_first_fragment_ports_briefly() {
+        let key = FragmentKey {
+            source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            id: 7,
+            protocol: 17,
+        };
+        let packet = |ports: Option<(u16, u16)>, fragment| Packet {
+            flow: Flow {
+                source: key.source,
+                destination: key.destination,
+                source_port: ports.map(|ports| ports.0),
+                destination_port: ports.map(|ports| ports.1),
+                protocol: Protocol::Udp,
+                interface_index: 1,
+                direction: Direction::Outgoing,
+            },
+            bytes: 1500,
+            fragment: Some(fragment),
+        };
+        let mut fragments = Fragments::default();
+        let now = Instant::now();
+        let mut later = packet(None, Fragment::Later(key));
+        fragments.apply(&mut later, now);
+        assert_eq!(later.flow.source_port, None, "no first fragment seen yet");
+        fragments.apply(&mut packet(Some((5000, 53)), Fragment::First(key)), now);
+        fragments.apply(&mut later, now);
+        assert_eq!(
+            (later.flow.source_port, later.flow.destination_port),
+            (Some(5000), Some(53))
+        );
+        let mut other = packet(None, Fragment::Later(FragmentKey { id: 8, ..key }));
+        fragments.apply(&mut other, now);
+        assert_eq!(other.flow.source_port, None, "identification must match");
+        let mut stale = packet(None, Fragment::Later(key));
+        fragments.apply(&mut stale, now + FRAGMENT_LIFETIME + Duration::from_secs(1));
+        assert_eq!(stale.flow.source_port, None, "entries expire");
+        fragments.expire(now + FRAGMENT_LIFETIME + Duration::from_secs(1));
+        assert!(fragments.ports.is_empty());
+        for id in 0..MAX_FRAGMENTED_DATAGRAMS as u32 + 10 {
+            fragments.apply(
+                &mut packet(Some((5000, 53)), Fragment::First(FragmentKey { id, ..key })),
+                now,
+            );
+        }
+        assert_eq!(fragments.ports.len(), MAX_FRAGMENTED_DATAGRAMS);
     }
 }
