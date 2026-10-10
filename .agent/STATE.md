@@ -42,8 +42,8 @@
   and deaf to SIGHUP. `tests/terminal.py` now checks a closed terminal without
   SIGHUP, SIGHUP after closing and a closed controlling terminal (exit 0 within
   2 s); `tests/helper.py` checks that the helper is reaped in both hang-up cases.
-- Review round 2 (branch `fix/review-round-2`, 2026-10-10, uncommitted at
-  handoff): likely root cause of issue #6 fixed (SOCK_DIAG deadline started before
+- Review round 2 merged as PR #7 (`c887692`, 2026-10-10); issue #6 is closed.
+  Likely root cause fixed (SOCK_DIAG deadline started before
   sendto(), which can autoload diag modules, plus a 2 s backoff after a timed-out
   dump and no deferral while V6ONLY was unknown). Also: drain before socket
   refresh and one-time deferral of local flows without a candidate, defer window
@@ -69,6 +69,15 @@
   remain unattributed. Separate container network namespaces are not fully covered.
 - Local installation uses `scripts/install.sh`, which refuses to replace an
   unrelated executable. Only explicitly requested `--demo` uses synthetic data.
+- Completion verified on 2026-10-10: `main` fast-forwarded to `c887692`; the
+  merged review worktree and local/remote branch were removed. UI and helper
+  were reinstalled with both scripts; installed SHA-256 hashes match the builds.
+  Helper remains root:tim 0750 with DAC_READ_SEARCH, NET_RAW and SYS_PTRACE.
+  Live `--once` attributed user and root processes; the sample had about
+  6 KiB/s unattributed in each direction versus about 4 MiB/s total TX.
+  Local fmt, Clippy with warnings denied and all 83 Rust tests passed; CI and
+  CodeQL passed on the merge commit. Remaining attribution work is tracked in
+  [issue #2](https://github.com/itmitalles-de/nettop/issues/2).
 - The redesigned README shares the site's banner and explicit DEMO image.
   `site/` contains the responsive project website, terminal recording and local
   licensed fonts. Pages is configured as public with custom domain
