@@ -1,3 +1,198 @@
+const root = document.documentElement;
+const STORAGE = { theme: 'nettop-theme', lang: 'nettop-lang' };
+
+function writeStored(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    // Storage may be unavailable; the choice then lasts for this page view only.
+  }
+}
+
+// English is the source text in index.html; German replaces it at runtime.
+const UI = {
+  en: {
+    title: 'nettop — your network, in view',
+    description: 'nettop is a Linux terminal network monitor inspired by nvtop. Live interface graphs, process traffic and keyboard-first setup, in one compact view.',
+    copyCommands: 'Copy commands',
+    copied: 'Copied!',
+    pressCopy: 'Press Ctrl/Cmd+C',
+    copiedStatus: 'Installation commands copied to the clipboard.',
+    selectedStatus: 'Commands selected. Press Control C or Command C to copy.',
+    toLight: 'Switch to light theme',
+    toDark: 'Switch to dark theme',
+    lightOn: 'Light theme on.',
+    darkOn: 'Dark theme on.',
+    languageOn: 'English language on.',
+    otherLanguage: { code: 'DE', lang: 'de', label: 'Auf Deutsch umschalten' },
+  },
+  de: {
+    title: 'nettop — dein Netzwerk im Blick',
+    description: 'nettop ist ein Netzwerkmonitor für das Linux-Terminal, inspiriert von nvtop. Live-Graphen der Schnittstellen, Traffic pro Prozess und Einrichtung per Tastatur, in einer kompakten Ansicht.',
+    copyCommands: 'Befehle kopieren',
+    copied: 'Kopiert!',
+    pressCopy: 'Strg/Cmd+C drücken',
+    copiedStatus: 'Installationsbefehle in die Zwischenablage kopiert.',
+    selectedStatus: 'Befehle markiert. Zum Kopieren Strg+C oder Cmd+C drücken.',
+    toLight: 'Zum hellen Design wechseln',
+    toDark: 'Zum dunklen Design wechseln',
+    lightOn: 'Helles Design aktiv.',
+    darkOn: 'Dunkles Design aktiv.',
+    languageOn: 'Deutsche Sprache aktiv.',
+    otherLanguage: { code: 'EN', lang: 'en', label: 'Switch to English' },
+  },
+};
+
+const DE = {
+  skip: 'Zum Inhalt springen',
+  homeLabel: 'nettop Startseite',
+  navLabel: 'Hauptnavigation',
+  navInside: 'Blick in nettop',
+  navInstall: 'Installation',
+  intro: '<span class="status-dot" aria-hidden="true"></span>Zu Hause in deinem Terminal.',
+  heroTitle: 'Dein Netz.<br>Klar im Blick.',
+  heroDescription: 'Sieh, was fließt. Finde, was ausgelastet ist. Ein Netzwerkmonitor für Linux mit Live-Graphen, Traffic pro Prozess und dem vertrauten Gefühl von htop und nvtop.',
+  getNettop: 'nettop holen <span aria-hidden="true">↗</span>',
+  closerLook: 'Genauer hinsehen',
+  heroFacts: 'Gebaut in Rust <span aria-hidden="true">/</span> Gemacht für Linux <span aria-hidden="true">/</span> MIT-Lizenz',
+  receive: '<i class="rx-dot" aria-hidden="true"></i>Empfangen',
+  send: '<i class="tx-dot" aria-hidden="true"></i>Senden',
+  compactView: 'Eine kompakte Ansicht.',
+  heroAlt: 'Echte nettop-Demo: grüner Empfangs- und gelber Sendeverlauf über der Tabelle mit Prozess-Traffic',
+  demoCaption: 'Echte Terminalausgabe. Demodaten.',
+  watchRun: 'Im Einsatz ansehen <span aria-hidden="true">▷</span>',
+  capabilitiesLabel: 'Überwachungsfunktionen',
+  signal1Title: 'Der Schnittstelle folgen.',
+  signal1Text: 'RX und TX aus den Zählern des Linux-Kernels.',
+  signal2Title: 'Den Prozess finden.',
+  signal2Text: 'Mitgeschnittener Traffic, zugeordnet zu den Socket-Besitzern.',
+  signal3Title: 'Auf der Tastatur bleiben.',
+  signal3Text: 'Suchen, sortieren, wechseln. Die Hände bleiben, wo sie sind.',
+  insideTitle: 'Fühlt sich vertraut an.<br>Passt in deinen Workflow.',
+  insideText: 'Im geteilten Fenster oder im Vollbild: nettop schafft Platz für den Traffic, der zählt, bis hinunter zu einem Terminal mit 36 × 16 Zeichen.',
+  tablistLabel: 'nettop-Ansichten erkunden',
+  'tab-monitor-title': 'Der Monitor',
+  'tab-monitor-text': 'Traffic oben. Prozesse darunter.',
+  'tab-setup-title': 'Nach deinem Geschmack',
+  'tab-setup-text': 'Farben, Graphen, Einheiten und mehr.',
+  'tab-sort-title': 'Finde die Fleißigen',
+  'tab-sort-text': 'Sortierung wählen. Den Bytes folgen.',
+  explorerHint: 'Wähle eine Ansicht, um die echte Oberfläche zu sehen.',
+  shortcut1: '<kbd>/</kbd> Tabelle durchsuchen',
+  shortcut2: '<kbd>c</kbd> Verbindungen untersuchen',
+  shortcut3: '<kbd>b</kbd> Bytes / Bits umschalten',
+  shortcut4: '<kbd>F12</kbd> Einstellungen speichern',
+  monitorAlt: 'nettop-Monitor im DEMO-Modus mit Traffic-Graphen und Prozesszeilen',
+  setupAlt: 'Echtes F2-Setup mit den Kategorien General, Interface, Chart und Processes',
+  sortAlt: 'Echtes F6-Sortiermenü mit Auswahl nach Traffic, RX, TX, Gesamt, PID und Befehl',
+  screenCaption: 'Native Terminalfarben. Dein Theme kommt mit.',
+  installTitle: 'Einmal einrichten.<br>Dann einfach nettop.',
+  installText: 'Aus dem Quellcode bauen, in dein Benutzerverzeichnis installieren und dem optionalen Capture-Helfer die nötigen Rechte geben. Danach startest du <code>nettop</code> als normaler Benutzer.',
+  requirements: 'Du brauchst Linux und Rust 1.88+. Die Befehle hier gelten für Ubuntu 24.04 oder neuer.',
+  adminSummary: 'Wofür sind Administratorrechte nötig?',
+  adminText: 'Die Installation von libpcap und die Einrichtung des Capture-Helfers erfordern einmalig eine Authentifizierung als Administrator. Die Terminal-Oberfläche hat keine Capabilities und läuft ohne sudo. Die Schnittstellenzähler funktionieren auch ohne den Helfer.',
+  captureLink: 'Lies, wie der Mitschnitt funktioniert',
+  accessNote: 'Open Source unter der MIT-Lizenz. Zum Klonen ist kein GitHub-Konto nötig.',
+  installHeading: 'Aus dem Quellcode installieren',
+  copyCommands: 'Befehle kopieren',
+  commentRuntime: '# Capture-Laufzeit + Capability-Werkzeuge',
+  commentNoSudo: '# Ab jetzt ohne sudo',
+  noCaptureText: 'Schnittstellen-Monitoring ohne Einrichtung.',
+  detailsTitle: 'Echte Zähler.<br>Klare Grenzen.',
+  detailsText1: 'Schnittstellenraten stammen aus den RX/TX-Zählern von Linux. Prozessraten stammen aus mitgeschnittenen IP-Paketen, zugeordnet zu Socket-Inodes und PIDs. Warteschlangengrößen werden nie als Traffic ausgegeben.',
+  detailsText2: 'Kurzlebige, geteilte oder unzugängliche Sockets können ohne Zuordnung bleiben. nettop zeigt nicht verfügbare Raten und verworfene Pakete an, statt Zahlen zu erfinden.',
+  measurementsLink: 'Die Messwerte verstehen',
+  videoLabel: 'Echte nettop-DEMO-Aufnahme mit Monitor, F2-Setup und F6-Sortierung',
+  videoCaption: 'Monitor, F2-Setup und F6-Sortierung in einer echten Terminalaufnahme. Synthetischer DEMO-Traffic.',
+  closingTitle: 'Ein kleines Fenster<br>in dein Netzwerk.',
+  makeRoom: 'Platz für nettop schaffen <span aria-hidden="true">↗</span>',
+  topLabel: 'Zurück nach oben',
+  madeBy: 'Gemacht von <a href="https://itmitalles.de">itmitalles</a>. Inspiriert von <a href="https://github.com/htop-dev/htop">htop</a> und <a href="https://github.com/Syllo/nvtop">nvtop</a>.',
+  sourceDocs: 'Quellcode &amp; Dokumentation',
+};
+
+const textNodes = [...document.querySelectorAll('[data-i18n]')].map(element => ({
+  element, key: element.dataset.i18n, en: element.innerHTML,
+}));
+const attrNodes = [...document.querySelectorAll('[data-i18n-attr]')].flatMap(element =>
+  element.dataset.i18nAttr.split(';').map(pair => {
+    const [attr, key] = pair.split(':');
+    return { element, attr, key, en: element.getAttribute(attr) };
+  })
+);
+const descriptionMeta = document.querySelector('meta[name="description"]');
+const languageToggle = document.getElementById('language-toggle');
+const themeToggle = document.getElementById('theme-toggle');
+const statusRegion = document.getElementById('copy-status');
+let currentLang = root.dataset.lang === 'de' ? 'de' : 'en';
+
+const t = key => UI[currentLang][key];
+
+function applyLanguage(lang) {
+  currentLang = lang;
+  root.lang = lang;
+  root.dataset.lang = lang;
+  for (const node of textNodes) {
+    node.element.innerHTML = (lang === 'de' && DE[node.key]) || node.en;
+  }
+  for (const node of attrNodes) {
+    node.element.setAttribute(node.attr, (lang === 'de' && DE[node.key]) || node.en);
+  }
+  document.title = t('title');
+  descriptionMeta.setAttribute('content', t('description'));
+  const other = t('otherLanguage');
+  languageToggle.textContent = other.code;
+  languageToggle.lang = other.lang;
+  languageToggle.setAttribute('aria-label', other.label);
+  languageToggle.title = other.label;
+  updateThemeControl();
+  root.classList.remove('i18n-pending');
+}
+
+languageToggle.addEventListener('click', () => {
+  const lang = currentLang === 'de' ? 'en' : 'de';
+  writeStored(STORAGE.lang, lang);
+  applyLanguage(lang);
+  statusRegion.textContent = t('languageOn');
+});
+
+const systemLight = window.matchMedia('(prefers-color-scheme: light)');
+const themeMetas = [...document.querySelectorAll('meta[name="theme-color"]')].map(meta => ({
+  meta, content: meta.getAttribute('content'),
+}));
+const THEME_COLORS = { dark: '#0b1725', light: '#f4f7f2' };
+
+const systemTheme = () => (systemLight.matches ? 'light' : 'dark');
+const effectiveTheme = () => root.dataset.theme || systemTheme();
+
+function updateThemeControl() {
+  const label = effectiveTheme() === 'dark' ? t('toLight') : t('toDark');
+  themeToggle.setAttribute('aria-label', label);
+  themeToggle.title = label;
+  for (const { meta, content } of themeMetas) {
+    meta.setAttribute('content', root.dataset.theme ? THEME_COLORS[root.dataset.theme] : content);
+  }
+}
+
+// The toggle always flips the visible theme. Picking the system theme again
+// removes the override, so the page keeps following the operating system.
+themeToggle.addEventListener('click', () => {
+  const theme = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  if (theme === systemTheme()) {
+    delete root.dataset.theme;
+    writeStored(STORAGE.theme, null);
+  } else {
+    root.dataset.theme = theme;
+    writeStored(STORAGE.theme, theme);
+  }
+  updateThemeControl();
+  statusRegion.textContent = theme === 'light' ? t('lightOn') : t('darkOn');
+});
+systemLight.addEventListener('change', updateThemeControl);
+
+applyLanguage(currentLang);
+
 const tabs = [...document.querySelectorAll('[data-view]')];
 const mobileTabs = window.matchMedia('(max-width: 800px)');
 
@@ -44,17 +239,17 @@ for (const button of document.querySelectorAll('[data-copy]')) {
     clearTimeout(reset);
     try {
       await navigator.clipboard.writeText(source.textContent.trim());
-      button.textContent = 'Copied!';
-      status.textContent = 'Installation commands copied to the clipboard.';
+      button.textContent = t('copied');
+      status.textContent = t('copiedStatus');
     } catch {
       const range = document.createRange();
       range.selectNodeContents(source);
       const selection = window.getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
-      button.textContent = 'Press Ctrl/Cmd+C';
-      status.textContent = 'Commands selected. Press Control C or Command C to copy.';
+      button.textContent = t('pressCopy');
+      status.textContent = t('selectedStatus');
     }
-    reset = setTimeout(() => { button.textContent = 'Copy commands'; }, 3500);
+    reset = setTimeout(() => { button.textContent = t('copyCommands'); }, 3500);
   });
 }
