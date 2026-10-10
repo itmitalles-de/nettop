@@ -31,17 +31,32 @@ UP = b"\x1b[A"
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def environment(config_home):
+def environment(config_home, **overrides):
     env = {**os.environ, "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm-256color"}
     # Exercise the color setting independently of a CI runner's color policy.
     env.pop("NO_COLOR", None)
+    # Keep the terminal text English regardless of the runner's locale.
+    for name in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        env.pop(name, None)
+    env["LC_ALL"] = "C.UTF-8"
+    for name, value in overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     return env
 
 
+DEFAULT_ARGUMENTS = ("--interval", "0.1", "--history", "10")
+
+
 class Terminal:
-    def __init__(self, binary, config_home):
+    def __init__(self, binary, config_home, arguments=DEFAULT_ARGUMENTS, ready=b"Device", **env):
         self.binary = binary
         self.config_home = config_home
+        self.arguments = arguments
+        self.ready = ready
+        self.env = env
         self.master, self.slave = pty.openpty()
         self.before = termios.tcgetattr(self.slave)
         self.output = bytearray()
@@ -51,15 +66,15 @@ class Terminal:
         try:
             fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
             self.child = subprocess.Popen(
-                [str(self.binary), "--demo", "--interval", "0.1", "--history", "10"],
+                [str(self.binary), "--demo", *self.arguments],
                 stdin=self.slave,
                 stdout=self.slave,
                 stderr=self.slave,
-                env=environment(self.config_home),
+                env=environment(self.config_home, **self.env),
                 start_new_session=True,
             )
             self.wait_for(
-                lambda: b"Device" in self.output and b"\x1b[?1049h" in self.output,
+                lambda: self.ready in self.output and b"\x1b[?1049h" in self.output,
                 "monitor startup",
             )
             return self
@@ -151,10 +166,12 @@ def persistence_and_overrides(binary, config_home):
         terminal.send(F12)
         terminal.wait_for(lambda: read_saved(path) is not None, "F12 saved settings")
         saved = read_saved(path)
+        # --interval 0.1 became 0.2 in Setup and is saved; the untouched
+        # --history 10 override is temporary and keeps the default.
         expected = {
             "version": 1,
             "interval_ms": 200,
-            "history_seconds": 10,
+            "history_seconds": 60,
             "bits": True,
             "color": True,
             "graph_style": "braille",
@@ -191,6 +208,67 @@ def persistence_and_overrides(binary, config_home):
     assert "bit/s" not in stdout.splitlines()[1], "saved units overrode --bytes"
     assert path.read_bytes() == before, "temporary CLI overrides overwrote saved preferences"
     print("PASS Setup: F2 edits, F12 persistence, F10 returns, restart and CLI overrides")
+
+
+def overrides_not_persisted(binary, config_home):
+    path = config_home / "nettop/config.json"
+    path.parent.mkdir(mode=0o700, parents=True)
+    original = {
+        "version": 1,
+        "interface": "nettop-gone",
+        "interval_ms": 1000,
+        "history_seconds": 120,
+        "bits": False,
+        "color": True,
+        "future_option": {"kept": True},
+    }
+    path.write_text(json.dumps(original))
+    path.chmod(0o600)
+    arguments = ("--bits", "--interval", "0.1", "--history", "10", "--no-color")
+    with Terminal(binary, config_home, arguments, NO_COLOR="1") as terminal:
+        terminal.expect(b"unknown keys")
+        terminal.expect(b"Saved interface nettop-gone unavailable")
+        # Saving without changes keeps every file value, despite CLI overrides,
+        # NO_COLOR and the automatic fallback for the missing interface.
+        before = path.read_bytes()
+        terminal.send(F12)
+        terminal.wait_for(lambda: path.read_bytes() != before, "F12 rewrote settings")
+        saved = read_saved(path)
+        assert saved == {**original, "show_graph": True, "graph_style": "steps", "rx_color": "green",
+                         "tx_color": "yellow", "connections": False, "sort": "traffic",
+                         "show_idle": True, "language": "auto"}, f"F12 persisted overrides: {saved}"
+        # An override that the user explicitly changes in Setup is saved.
+        mark = terminal.send(F2 + DOWN + DOWN + RIGHT + DOWN + b"+")
+        terminal.expect(b"Unsaved changes", mark)
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(path)["history_seconds"] != 120, "F12 saved Setup")
+        saved = read_saved(path)
+        assert saved["history_seconds"] == 20, f"Setup change was not saved: {saved}"
+        for key in ("interface", "interval_ms", "bits", "color", "future_option"):
+            assert saved[key] == original[key], f"F12 changed untouched {key}: {saved}"
+        terminal.send(F10)
+        terminal.quit()
+    print("PASS overrides: CLI options, NO_COLOR and interface fallback stay temporary; Setup edits save")
+
+
+def german_interface(binary, config_home):
+    path = config_home / "nettop/config.json"
+    with Terminal(binary, config_home, ready="Gerät".encode(), LC_ALL=None, LANG="de_DE.UTF-8") as terminal:
+        terminal.expect("Hilfe".encode())
+        terminal.expect("Speichern".encode())
+        mark = terminal.send(F2)
+        terminal.expect(b"Optionen: Allgemein", mark)
+        # General > Language: Auto -> English switches the running UI at once.
+        mark = terminal.send(RIGHT + DOWN + DOWN + DOWN + b"\r")
+        # Only changed cells are redrawn, so look for short distinct fragments.
+        terminal.expect(b"[English", mark)
+        terminal.expect(b"Done", mark)
+        terminal.send(F12)
+        terminal.wait_for(lambda: read_saved(path) is not None, "F12 saved the language")
+        assert read_saved(path)["language"] == "en", read_saved(path)
+        terminal.send(F10)
+        terminal.quit()
+    print("PASS language: German from LANG, Setup switches to English and F12 saves it")
 
 
 def malformed_settings(binary, config_home):
@@ -239,6 +317,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="nettop-setup-test-") as temporary:
         root = Path(temporary)
         persistence_and_overrides(binary, root / "preferences")
+        overrides_not_persisted(binary, root / "overrides")
+        german_interface(binary, root / "german")
         malformed_settings(binary, root / "malformed")
         vanished_interface(binary, root / "vanished")
     print("All Setup and configuration integration checks passed.")

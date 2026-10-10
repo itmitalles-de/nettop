@@ -152,9 +152,14 @@ and capture warnings get a status row when needed.
 ### Make it yours with F2
 
 Setup has **General**, **Interface**, **Chart**, and **Processes** panels. Change
-the refresh interval, units, interface, history, Steps/Braille drawing, RX/TX
-colors, view, sorting, and idle-row visibility. Hide the graph to give the table
-more room.
+the refresh interval, units, language, interface, history, Steps/Braille drawing,
+RX/TX colors, view, sorting, and idle-row visibility. Hide the graph to give the
+table more room.
+
+The terminal interface is available in English and German. **Auto** follows
+`LC_ALL`, `LC_MESSAGES`, or `LANG` (German for `de*` locales, otherwise English);
+General › Language selects English or German explicitly. Command-line help,
+errors, and `--json` output stay English.
 
 Use ↑ / ↓ to navigate, Tab or → to enter the options, and ← to return to the
 categories. Enter, Space, or `+` changes a value; `-` goes backward. Changes apply
@@ -168,13 +173,17 @@ Settings are saved atomically with private file permissions to
 `$XDG_CONFIG_HOME/nettop/config.json`, or `~/.config/nettop/config.json` when
 `XDG_CONFIG_HOME` is unset, empty, or relative.
 
-Explicit CLI options override saved preferences for that run. Pressing F12 saves
-the current values, including those overrides. `--no-color` and a nonempty
-`NO_COLOR` environment variable start in monochrome.
+Explicit CLI options override saved preferences for that run only. `--no-color`
+and a nonempty `NO_COLOR` environment variable start in monochrome. F12 keeps the
+saved values and adds only what you changed in Setup or with keys, so overrides
+are saved only when you change that setting yourself.
 
 Malformed or unsupported settings produce a warning and use defaults. Saving
-preserves the original file until it is fixed or moved aside. If a saved
-interface no longer exists, nettop warns and selects an interface automatically.
+preserves the original file until it is fixed or moved aside. Unknown keys, such
+as typos, produce a warning and are kept when saving. If a saved interface no
+longer exists, nettop warns and selects an interface automatically for that run;
+the saved choice remains until you choose another one. Run nettop without sudo:
+as root it refuses to save into another user's settings directory.
 
 </details>
 
@@ -245,11 +254,13 @@ sender and receiver PIDs exchange real IPv4/IPv6 TCP and UDP traffic; assertions
 cover measured rates, PID attribution, packet drops, and duplicate counting
 without changing network configuration. `tests/helper.py` also checks capability
 separation, unprivileged cross-user attribution, installer safeguards, bounded
-protocol input, and shutdown with a stopped helper.
+protocol input, shutdown with a stopped helper, and the fallback to direct
+counters when the helper stops answering.
 
 [CI](.github/workflows/ci.yml) is configured to run formatting, linting, unit
 tests on stable and Rust 1.88.0, release builds, terminal restoration, Setup and
-persistence checks, and capture tests in isolated Ubuntu 24.04 containers.
+persistence checks, a dependency audit, and capture tests in isolated, digest-pinned
+Ubuntu 24.04 containers.
 Building the test image needs access to its base image and package repositories.
 
 </details>
