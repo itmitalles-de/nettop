@@ -139,6 +139,7 @@ impl Lang {
                 )
                 .into(),
             CaptureNote::Extended => self.pick("Process rates: captured IP bytes; socket events with sampled fallback", "Prozessraten: mitgeschnittene IP-Bytes; Socket-Ereignisse mit Abtast-Fallback").into(),
+            CaptureNote::AllSocketPackets => self.pick("ALL: TCP/UDP socket packets across namespaces; forwarded traffic requires an interface selection", "ALLE: TCP/UDP-Socketpakete aller Namespaces; weitergeleiteten Verkehr auf einer Schnittstelle anzeigen").into(),
             CaptureNote::ExtendedIssue { detail } => format!("{}: {detail}",self.pick("Extended attribution", "Erweiterte Zuordnung")),
             CaptureNote::Sampled => self
                 .pick(
@@ -155,6 +156,18 @@ impl Lang {
             }
             CaptureNote::FlowLimit { packets } => {
                 format!("flow limit: {packets} packets unattributed")
+            }
+            CaptureNote::CaptureQueueLimit { packets } if de => {
+                format!("Mitschnittpuffer voll: {packets} Pakete ohne Zuordnungsdetails")
+            }
+            CaptureNote::CaptureQueueLimit { packets } => {
+                format!("capture queue full: {packets} packets without attribution detail")
+            }
+            CaptureNote::AttributionQueueLimit { packets } if de => {
+                format!("Zuordnungspuffer voll: {packets} Beobachtungen ohne weitere Wartezeit ausgewertet")
+            }
+            CaptureNote::AttributionQueueLimit { packets } => {
+                format!("attribution queue full: {packets} observations resolved without further waiting")
             }
             CaptureNote::Unreadable {
                 unsupported,

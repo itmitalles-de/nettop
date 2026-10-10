@@ -7,7 +7,7 @@ use libloading::Library;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,36 @@ const MAX_FLOWS: usize = 16_384;
 const MAX_INTERFACES: usize = 256;
 const MAX_FRAGMENTED_DATAGRAMS: usize = 4_096;
 const FRAGMENT_LIFETIME: Duration = Duration::from_secs(2);
+
+/// A coalescing notification, never an unbounded queue of wakeups.
+#[derive(Default)]
+pub(super) struct Wake {
+    pending: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl Wake {
+    pub fn notify(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *pending = true;
+        self.ready.notify_one();
+    }
+
+    pub fn wait(&self, duration: Duration) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (mut pending, _) = self
+            .ready
+            .wait_timeout_while(pending, duration, |pending| !*pending)
+            .unwrap_or_else(|error| error.into_inner());
+        *pending = false;
+    }
+}
 
 /// A capture start failure the UI can explain in its own language.
 #[derive(Debug)]
@@ -356,7 +386,7 @@ pub(super) struct Batch {
     /// Extended mode preserves individual header-only observations so a TCP
     /// handshake cannot widen a data packet beyond its actor syscall window.
     pub timed_flows: Vec<(Flow, TimedBytes)>,
-    pub untracked: HashMap<(u32, Direction), Untracked>,
+    pub untracked: HashMap<(u32, Direction, bool), Untracked>,
     pub dropped: u64,
     pub overflow: u64,
     pub unsupported: u64,
@@ -386,7 +416,11 @@ impl Batch {
             bytes.add(packet.bytes, timestamp);
         } else {
             self.overflow = self.overflow.saturating_add(1);
-            let key = (packet.flow.interface_index, packet.flow.direction);
+            let key = (
+                packet.flow.interface_index,
+                packet.flow.direction,
+                matches!(packet.flow.protocol, Protocol::Tcp | Protocol::Udp),
+            );
             if self.untracked.len() < MAX_INTERFACES || self.untracked.contains_key(&key) {
                 let count = self.untracked.entry(key).or_default();
                 count.bytes = count.bytes.saturating_add(packet.bytes);
@@ -401,14 +435,16 @@ pub(super) struct Capture {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     pub interface_indexes: bool,
+    pub wake: Arc<Wake>,
 }
 
 impl Capture {
-    pub(super) fn start() -> Result<Self> {
+    pub(super) fn start(wake: Arc<Wake>) -> Result<Self> {
         let buffer = Arc::new(Mutex::new(Batch::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_buffer = Arc::clone(&buffer);
         let thread_stop = Arc::clone(&stop);
+        let thread_wake = Arc::clone(&wake);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("nettop-capture".to_string())
@@ -481,6 +517,7 @@ impl Capture {
                         fragments_expired_at = now;
                     }
                     if let Ok(mut buffer) = thread_buffer.lock() {
+                        let previous_size = buffer.flows.len() + buffer.timed_flows.len();
                         for (packet, timestamp) in packets {
                             buffer.push(packet, clock.convert(&timestamp));
                         }
@@ -499,6 +536,13 @@ impl Capture {
                         if let Some(error) = failed.as_ref() {
                             buffer.error = Some(error.clone());
                         }
+                        // Wake the owner scanner before the bounded queue fills.
+                        // Low traffic retains the normal 250–500 ms cadence.
+                        if previous_size < MAX_FLOWS / 4
+                            && buffer.flows.len() + buffer.timed_flows.len() >= MAX_FLOWS / 4
+                        {
+                            thread_wake.notify();
+                        }
                     }
                     if failed.is_some() {
                         return;
@@ -515,6 +559,7 @@ impl Capture {
                 stop,
                 worker: Some(worker),
                 interface_indexes,
+                wake,
             }),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -592,6 +637,26 @@ mod tests {
     }
 
     #[test]
+    fn pressure_notifications_coalesce_and_wake_a_waiter() {
+        let wake = Arc::new(Wake::default());
+        wake.notify();
+        wake.notify();
+        assert!(*wake.pending.lock().unwrap());
+        wake.wait(Duration::ZERO);
+        assert!(!*wake.pending.lock().unwrap());
+        let waiting = Arc::clone(&wake);
+        let (done, result) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            waiting.wait(Duration::from_secs(5));
+            done.send(()).unwrap();
+        });
+        wake.notify();
+        result.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(!*wake.pending.lock().unwrap());
+    }
+
+    #[test]
     fn flow_storage_is_bounded_and_excess_bytes_remain_visible() {
         let mut batch = Batch::default();
         for port in 0..MAX_FLOWS + 1 {
@@ -617,7 +682,7 @@ mod tests {
         assert_eq!(
             batch
                 .untracked
-                .get(&(1, Direction::Outgoing))
+                .get(&(1, Direction::Outgoing, true))
                 .unwrap()
                 .bytes,
             128

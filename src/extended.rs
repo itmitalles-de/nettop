@@ -1,10 +1,10 @@
-//! Optional event/namespace/NAT attribution; never an alternate byte source.
+//! Optional socket-bound IP-packet and namespace/NAT attribution.
 use super::{
     LocalView,
     capture::{TimedBytes, monotonic_ns},
     conntrack::{self, Conntrack},
     event_owners::{self, Owners},
-    events::Events,
+    events::{Events, PacketEvent},
     links, loopback_path,
     packet::{Direction, Flow},
     published_port_proxy, socket_endpoints,
@@ -12,6 +12,8 @@ use super::{
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_OWNER_INODES: usize = 32_768;
@@ -25,14 +27,21 @@ enum InodeOwner {
 #[derive(Default)]
 struct OwnerIndex {
     entries: HashMap<(u64, u64), InodeOwner>,
+    positions: HashMap<(u64, u64), usize>,
     limited: bool,
 }
 
 impl OwnerIndex {
     fn refresh(&mut self, inventory: &Inventory) {
         self.entries.clear();
+        self.positions.clear();
         self.limited = false;
-        for socket in inventory.sockets.iter().filter(|socket| socket.current) {
+        for (position, socket) in inventory
+            .sockets
+            .iter()
+            .enumerate()
+            .filter(|(_, socket)| socket.current)
+        {
             let evidence = match socket.owners.as_slice() {
                 [] => continue,
                 [owner] => InodeOwner::Single(owner.identity),
@@ -43,6 +52,7 @@ impl OwnerIndex {
                 // Never drop a contradictory holder just to keep the table
                 // bounded. Suppress event-only certainty for this refresh.
                 self.entries.clear();
+                self.positions.clear();
                 self.limited = true;
                 break;
             }
@@ -54,6 +64,7 @@ impl OwnerIndex {
                     }
                 })
                 .or_insert(evidence);
+            self.positions.insert(key, position);
         }
     }
 
@@ -84,6 +95,18 @@ pub(super) struct Extended {
     links_at: Instant,
     links_error: Option<String>,
     pub pending: Vec<Pending>,
+    pub pending_packets: Vec<PendingPacket>,
+    packets: Vec<PacketEvent>,
+    packet_failed: bool,
+}
+pub(super) struct PendingPacket {
+    pub packet: PacketEvent,
+    pub since: Instant,
+}
+pub(super) enum PacketResult {
+    Owned(Socket, bool),
+    Pending,
+    Unknown,
 }
 pub(super) struct Pending {
     pub flow: Flow,
@@ -97,13 +120,33 @@ pub(super) enum Result {
     Unknown,
 }
 impl Extended {
+    #[cfg(test)]
+    pub(super) fn empty_for_test() -> Self {
+        Self {
+            events: None,
+            conntrack: None,
+            owners: Owners::default(),
+            sampled_owners: OwnerIndex::default(),
+            errors: Vec::new(),
+            conntrack_lost: 0,
+            issues: Vec::new(),
+            unconfirmed: Cell::new(false),
+            veth: HashSet::new(),
+            links_at: Instant::now(),
+            links_error: None,
+            pending: Vec::new(),
+            pending_packets: Vec::new(),
+            packets: Vec::new(),
+            packet_failed: false,
+        }
+    }
     pub fn available(&self) -> bool {
         self.events.is_some() || self.conntrack.is_some()
     }
 
-    pub fn start() -> Self {
+    pub fn start(wake: Arc<super::capture::Wake>) -> Self {
         let mut errors = Vec::new();
-        let events = Events::start()
+        let events = Events::start(wake)
             .map_err(|e| errors.push(format!("socket events: {e:#}")))
             .ok();
         let conntrack = Conntrack::start()
@@ -122,6 +165,87 @@ impl Extended {
             links_at: Instant::now() - Duration::from_secs(3),
             links_error: None,
             pending: Vec::new(),
+            pending_packets: Vec::new(),
+            packets: Vec::new(),
+            packet_failed: false,
+        }
+    }
+
+    /// Startup is atomic: Events exists only if every packet/lifecycle hook
+    /// was attached. Runtime errors never turn on a second All byte source.
+    pub fn packet_capture_active(&self) -> bool {
+        self.events.is_some()
+    }
+
+    pub fn packet_capture_failed(&self) -> bool {
+        self.packet_failed
+    }
+
+    pub fn take_packets(&mut self) -> Vec<PacketEvent> {
+        std::mem::take(&mut self.packets)
+    }
+
+    pub fn resolve_packet(
+        &self,
+        packet: &PacketEvent,
+        inventory: &Inventory,
+        allow_partial: bool,
+    ) -> PacketResult {
+        let evidence = self.owners.resolve_packet(packet);
+        let resolved = match evidence {
+            event_owners::Match::Owned(socket) if !self.sampled_owners.vetoes(&socket) => {
+                Some(socket)
+            }
+            event_owners::Match::Observed(observed) => {
+                // The packet itself identifies the actual socket incarnation,
+                // even when it was queued outside the owner's syscall window.
+                // Corroborate only that same current inode and full PID identity.
+                self.sampled_owners
+                    .positions
+                    .get(&(observed.key.namespace, observed.key.inode))
+                    .and_then(|position| inventory.sockets.get(*position))
+                    .filter(|socket| {
+                        socket.current
+                            && socket.key.namespace == observed.key.namespace
+                            && socket.key.inode != 0
+                            && socket.key.inode == observed.key.inode
+                            && socket.owner().map(|owner| owner.identity)
+                                == observed.owner().map(|owner| owner.identity)
+                            && !self.sampled_owners.vetoes(&observed)
+                    })
+                    .cloned()
+            }
+            _ => None,
+        };
+        match resolved {
+            Some(mut socket) => {
+                // Resolve ownership first. A UDP socket can serve many peers;
+                // neither its sampled wildcard nor a previous syscall's peer
+                // identifies this packet's connection.
+                let endpoints = (packet.flags & 1 != 0)
+                    .then(|| {
+                        let address = |bytes: [u8; 16], port| match packet.family as i32 {
+                            libc::AF_INET => Some(SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+                                port,
+                            )),
+                            libc::AF_INET6 => {
+                                Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(bytes)), port))
+                            }
+                            _ => None,
+                        };
+                        address(packet.local_addr, packet.local_port)
+                            .zip(address(packet.remote_addr, packet.remote_port))
+                    })
+                    .flatten();
+                if let Some((local, remote)) = endpoints {
+                    socket.key.local = local;
+                    socket.key.remote = remote;
+                }
+                PacketResult::Owned(socket, endpoints.is_some())
+            }
+            None if !allow_partial => PacketResult::Pending,
+            None => PacketResult::Unknown,
         }
     }
     pub fn refresh(&mut self, inventory: &Inventory) {
@@ -133,7 +257,9 @@ impl Extended {
         }
         if let Some(events) = &self.events {
             let batch = events.drain();
+            self.packets = batch.packets;
             if let Some(error) = batch.error {
+                self.packet_failed = true;
                 self.issues.push(format!("socket events: {error}"));
             }
             let loss_details = batch.losses.describe();
@@ -406,6 +532,9 @@ mod tests {
             links_at: Instant::now(),
             links_error: None,
             pending: Vec::new(),
+            pending_packets: Vec::new(),
+            packets: Vec::new(),
+            packet_failed: false,
         }
     }
     fn packet(source: &str, destination: &str, index: u32, direction: Direction) -> Flow {
@@ -490,6 +619,130 @@ mod tests {
             kind: if receive { 2 } else { 1 },
             ..Event::default()
         }
+    }
+
+    #[test]
+    fn actual_foreign_socket_packet_needs_no_conntrack_but_vetoes_changed_owners() {
+        let mut inventory = Inventory::new();
+        let namespace = inventory.host_namespace() + 1;
+        let mut socket = listener(&inventory, 200);
+        socket.key.namespace = namespace;
+        socket.key.local = "127.0.0.1:8080".parse().unwrap();
+        socket.key.remote = "127.0.0.1:40000".parse().unwrap();
+        socket.owners[0].identity = ProcessIdentity {
+            pid: 200,
+            start_time: unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64,
+        };
+        inventory.sockets.push(socket);
+        let event = actor(namespace, 200, "127.0.0.1:8080", "127.0.0.1:40000", true);
+        let packet = PacketEvent {
+            timestamp_ns: 25_000_000,
+            socket_id: 200,
+            inode: 200,
+            netns: namespace as u32,
+            ifindex: 1, // Not the host's loopback despite sharing its index.
+            ip_bytes: 1052,
+            family: libc::AF_INET as u16,
+            protocol: 17,
+            local_port: 8080,
+            remote_port: 40000,
+            local_addr: event.local_addr,
+            remote_addr: event.remote_addr,
+            receive: 1,
+            ..PacketEvent::default()
+        };
+        let mut extended = extended();
+        extended
+            .owners
+            .update(vec![event], 0, 30_000_000, &inventory);
+        extended.sampled_owners.refresh(&inventory);
+        assert!(
+            matches!(extended.resolve_packet(&packet, &inventory, false), PacketResult::Owned(socket, _) if socket.key.namespace == namespace && socket.owner().unwrap().identity.pid == 200)
+        );
+        // Distinct peers on one unconnected UDP descriptor must not inherit
+        // the inventory wildcard or the previous lifecycle event's peer.
+        inventory.sockets[0].key.remote = "0.0.0.0:0".parse().unwrap();
+        for remote_port in [41000, 42000] {
+            let peer_packet = PacketEvent {
+                flags: 1,
+                remote_port,
+                ..packet
+            };
+            let PacketResult::Owned(socket, known) =
+                extended.resolve_packet(&peer_packet, &inventory, true)
+            else {
+                panic!("same proven descriptor");
+            };
+            assert!(known);
+            assert_eq!(socket.key.remote.port(), remote_port);
+            assert_eq!(socket.key.inode, packet.inode);
+        }
+        assert!(
+            matches!(
+                extended.resolve_packet(&packet, &inventory, true),
+                PacketResult::Owned(_, false)
+            ),
+            "incomplete transport headers must only credit process bytes"
+        );
+        // Same PID number with a new start time is not the packet's actor.
+        inventory.sockets[0].owners[0].identity.start_time += 1;
+        extended.sampled_owners.refresh(&inventory);
+        assert!(matches!(
+            extended.resolve_packet(&packet, &inventory, false),
+            PacketResult::Pending
+        ));
+        assert!(matches!(
+            extended.resolve_packet(&packet, &inventory, true),
+            PacketResult::Unknown
+        ));
+    }
+
+    #[test]
+    fn packet_loss_or_shared_descriptors_never_select_one_actor() {
+        let mut inventory = Inventory::new();
+        let namespace = inventory.host_namespace();
+        let event = actor(namespace, 200, "192.0.2.1:8080", "198.51.100.2:40000", true);
+        let packet = PacketEvent {
+            timestamp_ns: 15_000_000,
+            socket_id: 200,
+            inode: 200,
+            netns: namespace as u32,
+            ifindex: 2,
+            ip_bytes: 1052,
+            family: libc::AF_INET as u16,
+            protocol: 17,
+            receive: 1,
+            local_port: event.local_port,
+            remote_port: event.remote_port,
+            local_addr: event.local_addr,
+            remote_addr: event.remote_addr,
+            ..PacketEvent::default()
+        };
+        let mut extended = extended();
+        extended
+            .owners
+            .update(vec![event], 0, 21_000_000, &inventory);
+        assert!(matches!(
+            extended.resolve_packet(&packet, &inventory, true),
+            PacketResult::Owned(_, _)
+        ));
+        let mut shared = listener(&inventory, 200);
+        shared.owners.push(shared.owners[0].clone());
+        inventory.sockets.push(shared);
+        extended.sampled_owners.refresh(&inventory);
+        assert!(matches!(
+            extended.resolve_packet(&packet, &inventory, true),
+            PacketResult::Unknown
+        ));
+        inventory.sockets.clear();
+        extended.sampled_owners.refresh(&inventory);
+        extended
+            .owners
+            .update(Vec::new(), 1, 22_000_000, &inventory);
+        assert!(matches!(
+            extended.resolve_packet(&packet, &inventory, true),
+            PacketResult::Unknown
+        ));
     }
 
     #[test]

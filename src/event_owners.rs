@@ -1,7 +1,7 @@
-//! Bounded process-context evidence. Packet bytes always come from libpcap.
+//! Bounded process-context evidence for captured IP packets.
 use super::{
     capture::TimedBytes,
-    events::Event,
+    events::{Event, PacketEvent},
     packet::Protocol,
     sockets::{Inventory, Owner, ProcessIdentity, Socket, SocketKey, canonical_ip},
 };
@@ -72,6 +72,7 @@ pub(super) struct Owners {
     addresses: HashSet<(u64, IpAddr)>,
     // None marks an overfull tuple. Never drop only the conflicting owners.
     tuples: HashMap<Tuple, Option<Vec<Key>>>,
+    socket_records: HashMap<(u64, u64), Option<Vec<Key>>>,
     bindings: HashMap<(u64, u16), Option<Vec<Binding>>>,
 }
 pub(super) enum Match {
@@ -90,6 +91,7 @@ impl Owners {
         self.namespaces.clear();
         self.addresses.clear();
         self.tuples.clear();
+        self.socket_records.clear();
         self.bindings.clear();
         self.bindings_limited = false;
         self.unsafe_until = self.unsafe_until.max(now.saturating_add(RETAIN));
@@ -322,6 +324,7 @@ impl Owners {
         self.namespaces.clear();
         self.addresses.clear();
         self.tuples.clear();
+        self.socket_records.clear();
         self.bindings.clear();
         self.bindings_limited = false;
         self.windows = 0;
@@ -360,6 +363,18 @@ impl Owners {
             self.namespaces.insert(key.namespace);
             if !key.local.ip().is_unspecified() {
                 self.addresses.insert((key.namespace, key.local.ip()));
+            }
+            let records = self
+                .socket_records
+                .entry(socket_id)
+                .or_insert_with(|| Some(Vec::new()));
+            if let Some(keys) = records {
+                if keys.len() >= MAX_CANDIDATES {
+                    self.limited = true;
+                    *records = None;
+                } else {
+                    keys.push(key.clone());
+                }
             }
             let candidates = self
                 .tuples
@@ -499,6 +514,97 @@ impl Owners {
         self.addresses.contains(&(namespace, canonical_ip(address)))
     }
 
+    /// The kernel supplied the actual socket incarnation, so a distinct
+    /// SO_REUSEPORT socket or pre-DNAT listener cannot compete for this packet.
+    /// Shared actors on this very socket still veto ownership. An open actor
+    /// outside its syscall needs exact current descriptor corroboration by the
+    /// caller (Observed); positive socket identity is not a process identity.
+    pub fn resolve_packet(&self, packet: &PacketEvent) -> Match {
+        if packet.socket_id == 0
+            || packet.netns == 0
+            || packet.ip_bytes == 0
+            || packet.timestamp_ns <= self.unsafe_until
+            || packet.receive > 1
+            || packet.reserved != 0
+            || packet.flags & !3 != 0
+            || self.updated_at.saturating_sub(packet.timestamp_ns) > RETAIN
+        {
+            return Match::Ambiguous;
+        }
+        let id = (u64::from(packet.netns), packet.socket_id);
+        if self
+            .lifetimes
+            .get(&id)
+            .is_some_and(|lifetime| lifetime.conflict)
+            || self
+                .closed
+                .get(&id)
+                .is_some_and(|closed| packet.timestamp_ns > *closed)
+        {
+            return Match::Ambiguous;
+        }
+        let Some(keys) = self.socket_records.get(&id) else {
+            return Match::Missing;
+        };
+        let Some(keys) = keys else {
+            return Match::Ambiguous;
+        };
+        let protocol = match packet.protocol {
+            6 => Protocol::Tcp,
+            17 => Protocol::Udp,
+            _ => return Match::Missing,
+        };
+        let mut candidate: Option<(&Key, &Record)> = None;
+        let mut contained = false;
+        let bit = if packet.receive == 1 { 2 } else { 1 };
+        for key in keys {
+            let record = &self.records[key];
+            if key.protocol != protocol
+                || (packet.inode != 0
+                    && record.socket.key.inode != 0
+                    && packet.inode != record.socket.key.inode)
+                || record.closed_conflict
+            {
+                return Match::Ambiguous;
+            }
+            if let Some((previous, _)) = candidate {
+                if previous.owner != key.owner
+                    || previous.process_started_ns != key.process_started_ns
+                {
+                    return Match::Ambiguous;
+                }
+            } else {
+                candidate = Some((key, record));
+            }
+            if record.lifetime.is_some_and(|life| {
+                life.first <= packet.timestamp_ns
+                    && packet.timestamp_ns <= life.last
+                    && life.directions & bit != 0
+            }) {
+                contained = true;
+            }
+            for direction in [bit, 3] {
+                let from = record.windows.partition_point(|w| w.directions < direction);
+                let to = record
+                    .windows
+                    .partition_point(|w| w.directions <= direction);
+                let windows = &record.windows[from..to];
+                let at = windows.partition_point(|w| w.last < packet.timestamp_ns);
+                if windows.get(at).is_some_and(|w| {
+                    w.first <= packet.timestamp_ns && packet.timestamp_ns <= w.last
+                }) {
+                    contained = true;
+                }
+            }
+        }
+        match candidate {
+            Some((_, record)) if contained => Match::Owned(record.socket.clone()),
+            Some((_, record)) if record.closed.is_none() => Match::Observed(record.socket.clone()),
+            Some(_) => Match::Ambiguous,
+            None => Match::Missing,
+        }
+    }
+
     pub fn resolve(
         &self,
         namespace: u64,
@@ -619,6 +725,71 @@ fn address(family: u16, bytes: [u8; 16], port: u16) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_socket_identity_proves_demux_but_not_a_shared_or_unobserved_actor() {
+        let actor = event(7, 8, 10_000_000, 15_000_000);
+        let mut owners = Owners::default();
+        owners.update(vec![actor], 0, 20_000_000, &Inventory::new());
+        let mut packet = PacketEvent {
+            timestamp_ns: 12_000_000,
+            socket_id: 8,
+            netns: 1,
+            protocol: 17,
+            ip_bytes: 42,
+            // The wire tuple can have changed at NAT; incarnation is proof.
+            local_addr: [0; 16],
+            ..PacketEvent::default()
+        };
+        assert!(matches!(owners.resolve_packet(&packet), Match::Owned(_)));
+        packet.timestamp_ns = 18_000_000;
+        assert!(matches!(owners.resolve_packet(&packet), Match::Observed(_)));
+        packet.socket_id = 9;
+        assert!(matches!(owners.resolve_packet(&packet), Match::Missing));
+        packet.socket_id = 8;
+        packet.netns = 2;
+        assert!(matches!(owners.resolve_packet(&packet), Match::Missing));
+        packet.netns = 1;
+        owners.update(
+            vec![Event { tgid: 9, ..actor }],
+            0,
+            21_000_000,
+            &Inventory::new(),
+        );
+        assert!(matches!(owners.resolve_packet(&packet), Match::Ambiguous));
+        owners.update(Vec::new(), 1, 22_000_000, &Inventory::new());
+        assert!(matches!(owners.resolve_packet(&packet), Match::Ambiguous));
+    }
+
+    #[test]
+    fn packet_incarnation_rejects_inode_reuse_and_packets_after_final_close() {
+        let actor = Event {
+            inode: 7,
+            ..event(7, 8, 10_000_000, 15_000_000)
+        };
+        let mut owners = Owners::default();
+        owners.update(vec![actor], 0, 20_000_000, &Inventory::new());
+        let mut packet = PacketEvent {
+            timestamp_ns: 12_000_000,
+            socket_id: 8,
+            netns: 1,
+            inode: 99,
+            protocol: 17,
+            ip_bytes: 42,
+            ..PacketEvent::default()
+        };
+        assert!(matches!(owners.resolve_packet(&packet), Match::Ambiguous));
+        packet.inode = 7;
+        let close = Event {
+            kind: 4,
+            timestamp_ns: 16_000_000,
+            ..actor
+        };
+        owners.update(vec![close], 0, 21_000_000, &Inventory::new());
+        assert!(matches!(owners.resolve_packet(&packet), Match::Owned(_)));
+        packet.timestamp_ns = 18_000_000;
+        assert!(matches!(owners.resolve_packet(&packet), Match::Ambiguous));
+    }
     fn event(pid: u32, id: u64, start: u64, end: u64) -> Event {
         Event {
             tgid: pid,
