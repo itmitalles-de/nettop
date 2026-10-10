@@ -95,6 +95,9 @@ pub(super) struct Inventory {
     owner_keys: HashMap<u64, SocketKey>,
     owner_flags: (bool, bool),
     owners_stale: bool,
+    /// Inodes whose previous owner the latest scan kept although no
+    /// descriptor was found; a second miss drops it.
+    carried_owners: HashSet<u64>,
     owner_scan_cost: Duration,
     ipv6_modes: HashMap<SocketKey, bool>,
     ipv6_attempts: HashMap<SocketKey, Instant>,
@@ -127,6 +130,7 @@ impl Inventory {
             owner_keys: HashMap::new(),
             owner_flags: (false, false),
             owners_stale: false,
+            carried_owners: HashSet::new(),
             owner_scan_cost: Duration::ZERO,
             ipv6_modes: HashMap::new(),
             ipv6_attempts: HashMap::new(),
@@ -239,8 +243,15 @@ impl Inventory {
             .filter(|inode| *inode != 0)
             .collect();
         let started = Instant::now();
-        let (owners, restricted, limited) = scan_owners(&live_inodes, &self.users);
+        let (mut owners, restricted, limited) = scan_owners(&live_inodes, &self.users);
         self.owner_scan_cost = started.elapsed();
+        self.carried_owners = carry_closing_owners(
+            current,
+            &mut owners,
+            &self.owners,
+            &self.owner_keys,
+            &self.carried_owners,
+        );
         self.owners = owners;
         self.owner_keys = current
             .iter()
@@ -340,6 +351,15 @@ impl Inventory {
             let socket = &self.sockets[index];
             !socket.current && socket.key.inode != 0
         });
+        // A connection waiting in the accept queue is listed without an inode
+        // until accept() gives it one. The vanished queue entry is that same
+        // connection, not a competing incarnation of the later inode socket.
+        let accepted_since = exact
+            .iter()
+            .map(|&index| &self.sockets[index])
+            .filter(|socket| socket.key.inode != 0)
+            .map(|socket| socket.observed)
+            .max();
         let mut best = None;
         let mut best_score = 0;
         let mut ambiguous = false;
@@ -353,6 +373,9 @@ impl Inventory {
         for (index, is_exact) in candidates {
             let socket = &self.sockets[index];
             if is_exact && continued && closing_remnant(socket) {
+                continue;
+            }
+            if is_exact && accepted_since.is_some_and(|seen| accepted_queue_entry(socket, seen)) {
                 continue;
             }
             // Segments of an existing TCP connection never reach a listener on
@@ -404,6 +427,47 @@ impl Inventory {
             .cloned()
             .unwrap_or_else(|| uid.to_string())
     }
+}
+
+/// The socket tables are read before descriptors are scanned. A process that
+/// closes a socket in between leaves it listed but without a visible owner,
+/// although that owner sent and received the bytes still awaiting attribution
+/// in this pass. Keep the owner from the previous scan of the same socket
+/// incarnation for one scan; the closed socket then leaves the table, or a
+/// second scan without any owner drops it. Returns the carried inodes.
+fn carry_closing_owners(
+    current: &[Socket],
+    owners: &mut HashMap<u64, Vec<Owner>>,
+    previous: &HashMap<u64, Vec<Owner>>,
+    previous_keys: &HashMap<u64, SocketKey>,
+    previously_carried: &HashSet<u64>,
+) -> HashSet<u64> {
+    let mut carried = HashSet::new();
+    for socket in current {
+        let inode = socket.key.inode;
+        if inode == 0
+            || owners.contains_key(&inode)
+            || previously_carried.contains(&inode)
+            || previous_keys.get(&inode) != Some(&socket.key)
+        {
+            continue;
+        }
+        if let Some(known) = previous.get(&inode).filter(|known| !known.is_empty()) {
+            owners.insert(inode, known.clone());
+            carried.insert(inode);
+        }
+    }
+    carried
+}
+
+/// A retained, inode-less TCP entry superseded by a socket of the same
+/// endpoint pair that was still listed afterwards.
+fn accepted_queue_entry(socket: &Socket, accepted_seen: Instant) -> bool {
+    socket.key.protocol == Protocol::Tcp
+        && !socket.current
+        && socket.key.inode == 0
+        && socket.owners.is_empty()
+        && socket.observed < accepted_seen
 }
 
 fn closing_remnant(socket: &Socket) -> bool {
@@ -1029,6 +1093,38 @@ mod tests {
     }
 
     #[test]
+    fn accept_queue_entry_does_not_compete_with_the_accepted_socket() {
+        let local = "127.0.0.1:8080".parse().unwrap();
+        let remote = "127.0.0.1:50000".parse().unwrap();
+        let queued_at = Instant::now();
+        let mut queued = owned_socket(key("127.0.0.1:8080", "127.0.0.1:50000", 0), 0, false);
+        queued.owners.clear();
+        queued.state = "ESTABLISHED".to_string();
+        queued.observed = queued_at;
+        let mut accepted = owned_socket(key("127.0.0.1:8080", "127.0.0.1:50000", 7), 70, true);
+        accepted.observed = queued_at + Duration::from_millis(250);
+        let mut listener = owned_socket(key("127.0.0.1:8080", "0.0.0.0:0", 1), 1, true);
+        listener.state = "LISTEN".to_string();
+        let inventory = inventory_with(vec![listener.clone(), queued.clone(), accepted.clone()]);
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)),
+            Some(70)
+        );
+        // Still the same connection after the accepted socket closed, too.
+        accepted.current = false;
+        let inventory = inventory_with(vec![listener.clone(), queued.clone(), accepted.clone()]);
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)),
+            Some(70)
+        );
+        // A queue entry seen after an older connection closed is a different
+        // incarnation, and stays unattributed.
+        queued.observed = accepted.observed + Duration::from_millis(250);
+        let inventory = inventory_with(vec![listener, queued, accepted]);
+        assert!(resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)).is_none());
+    }
+
+    #[test]
     fn unscanned_new_sockets_are_pending_not_lost() {
         let mut socket = owned_socket(key("192.0.2.1:50000", "198.51.100.2:443", 9), 0, true);
         socket.owners.clear();
@@ -1188,6 +1284,44 @@ mod tests {
                 start_time: 11
             }
         );
+    }
+
+    #[test]
+    fn owner_closing_during_a_scan_is_kept_for_one_scan() {
+        let closing = owned_socket(key("127.0.0.1:40000", "127.0.0.1:8080", 7), 7, true);
+        let reused = owned_socket(key("127.0.0.1:40002", "127.0.0.1:8080", 8), 8, true);
+        let moved = owned_socket(key("127.0.0.1:40004", "127.0.0.1:8080", 9), 9, true);
+        let current = vec![closing.clone(), reused.clone(), moved.clone()];
+        let previous: HashMap<_, _> = current
+            .iter()
+            .map(|socket| (socket.key.inode, socket.owners.clone()))
+            .collect();
+        let mut previous_keys: HashMap<_, _> = current
+            .iter()
+            .map(|socket| (socket.key.inode, socket.key.clone()))
+            .collect();
+        // Inode 8 was a different endpoint pair at the previous scan.
+        previous_keys.insert(8, key("127.0.0.1:39999", "127.0.0.1:8080", 8));
+        // The descriptor of inode 9 now belongs to another process.
+        let mut owners = HashMap::from([(9, owned_socket(moved.key.clone(), 90, true).owners)]);
+        let carried = carry_closing_owners(
+            &current,
+            &mut owners,
+            &previous,
+            &previous_keys,
+            &HashSet::new(),
+        );
+        assert_eq!(carried, HashSet::from([7]));
+        assert_eq!(owners[&7], closing.owners);
+        assert!(!owners.contains_key(&8));
+        assert_eq!(owners[&9][0].identity.pid, 90);
+
+        // A socket still listed without any owner at the next scan is dropped.
+        let mut next = HashMap::new();
+        let again =
+            carry_closing_owners(&current[..1], &mut next, &owners, &previous_keys, &carried);
+        assert!(again.is_empty());
+        assert!(next.is_empty());
     }
 
     #[test]

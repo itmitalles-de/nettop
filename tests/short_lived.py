@@ -6,6 +6,7 @@ Run as root in the isolated container: python3 tests/short_lived.py /path/to/net
 import json
 import multiprocessing as mp
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -13,6 +14,14 @@ import time
 
 PAYLOAD = b"s" * 65536
 CONNECTIONS = 8
+
+
+def receive_all(connection):
+    received = 0
+    with connection:
+        while data := connection.recv(65536):
+            received += len(data)
+    return received
 
 
 def tcp_server(port_pipe, done):
@@ -23,12 +32,13 @@ def tcp_server(port_pipe, done):
         total = 0
         for _ in range(CONNECTIONS):
             connection, _ = listener.accept()
-            with connection:
-                while True:
-                    data = connection.recv(65536)
-                    if not data:
-                        break
-                    total += len(data)
+            total += receive_all(connection)
+        # A slow acceptor: the connection waits in the accept queue, listed
+        # without an inode, across attribution passes before accept().
+        select.select([listener], [], [])
+        time.sleep(0.6)
+        connection, _ = listener.accept()
+        total += receive_all(connection)
         port_pipe.send(total)
         done.wait(40)
 
@@ -79,6 +89,12 @@ def main():
             for _ in range(8):
                 client.send(b"u" * 1024)
             assert udp_parent.recv() == "ok"
+    with socket.socket() as client:
+        client.connect(("127.0.0.1", tcp_port))
+        # Sent 0.8 s after the delayed accept().
+        time.sleep(1.4)
+        client.sendall(PAYLOAD)
+        time.sleep(0.05)
     tcp_total = tcp_parent.recv()
     udp_total = udp_parent.recv()
     output, errors = monitor.communicate(timeout=40)
