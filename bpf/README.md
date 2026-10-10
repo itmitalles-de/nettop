@@ -13,6 +13,10 @@ functions. The loader must attach every program successfully or detach the
 partial set and report that the optional backend is unavailable. Map/ring
 access through existing descriptors continues after dropping those capabilities.
 No maps or programs need to be pinned.
+The `armed` array has one `u32` key and value, initially zero. The loader writes
+one only after every hook is attached; entry state and metadata publication stay
+disabled during attachment so partial trampoline configurations cannot seed
+an unmatched operation.
 
 `inet_sendmsg` and `inet6_sendmsg` cover the IP-family userspace send paths;
 `socket.c` can bypass the exported `sock_sendmsg` wrapper. `inet_recvmsg` and
@@ -46,8 +50,12 @@ is read after the call; a caller that requests no peer address can leave it
 unknown. No payload bytes, iovecs, or send/receive byte counts are read or stored.
 
 `events` is a 4 MiB ring buffer. `stats` is an array with one `u32` key (zero)
-and four `u64` counters: ring reservation failures, in-flight call failures,
-socket-ID failures and peer metadata read failures. Consumers must surface
+and nine `u64` fields: ring reservation failures, in-flight map update failures,
+socket-ID failures, peer metadata read failures, nested calls, last nested
+call age in nanoseconds, last nested depth, a bitmask of nested call kinds and
+in-flight map deletion failures.
+The last age/depth are diagnostic snapshots and may be updated independently
+by concurrent collisions; no process or thread IDs are exported. Consumers must surface
 losses and avoid confident attribution across missing lifecycle evidence.
 
 Events identify the process performing an operation, not exclusive descriptor

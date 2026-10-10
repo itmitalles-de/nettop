@@ -136,17 +136,23 @@ impl Extended {
             if let Some(error) = batch.error {
                 self.issues.push(format!("socket events: {error}"));
             }
+            let loss_details = batch.losses.describe();
             if batch.lost > 0 {
                 self.issues.push(format!(
-                    "{} socket events lost; uncertain owners withheld",
-                    batch.lost
+                    "{} socket events lost ({}); uncertain owners withheld",
+                    batch.lost, loss_details
                 ));
             }
             self.owners
                 .update(batch.events, batch.lost, monotonic_ns(), inventory);
+            if batch.lost > 0 {
+                self.owners.describe_loss(loss_details);
+            }
             if self.owners.suppressed() {
-                self.issues
-                    .push("socket event evidence incomplete; uncertain owners withheld".into());
+                self.issues.push(format!(
+                    "socket event evidence incomplete ({}); uncertain owners withheld",
+                    self.owners.suppression_reason().unwrap_or("unknown reason")
+                ));
             }
         }
         if let Some(ct) = &self.conntrack {

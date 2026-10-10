@@ -62,7 +62,11 @@ struct lifecycle_event {
     char comm[16];
 };
 _Static_assert(sizeof(struct lifecycle_event) == 112, "lifecycle event ABI");
-struct statistics { __u64 lost_events, pending_failures, socket_failures, read_failures; };
+struct statistics {
+    __u64 lost_events, pending_failures, socket_failures, read_failures;
+    __u64 nested_calls, nested_last_age_ns, nested_last_depth, nested_kind_mask;
+    __u64 pending_delete_failures;
+};
 struct pending_key { __u64 tid; __u32 kind; __u32 pad; };
 struct call_state { __u64 started_ns; __u8 peer[28]; __u32 peer_len, depth, nested; };
 struct {
@@ -75,6 +79,12 @@ struct {
     __type(key, __u32);
     __type(value, struct statistics);
 } stats SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} armed SEC(".maps");
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
@@ -93,6 +103,13 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } sequence SEC(".maps");
+
+static __always_inline int ready(void)
+{
+    __u32 zero = 0;
+    __u32 *enabled = bpf_map_lookup_elem(&armed, &zero);
+    return enabled && *enabled == 1;
+}
 
 static __always_inline void failure(int which)
 {
@@ -150,13 +167,23 @@ static __always_inline void save_peer(struct call_state *state, struct msghdr *m
 
 static __always_inline int enter_call(struct sock *sk, struct msghdr *msg, __u32 kind)
 {
+    if (!ready()) return 0;
     if (!sk || !supported(sk)) return 0;
     struct pending_key key = { .tid = bpf_get_current_pid_tgid(), .kind = kind };
     struct call_state *active = bpf_map_lookup_elem(&pending, &key);
     if (active) {
         active->depth++;
         active->nested = 1;
-        failure(1);
+        __u32 zero = 0;
+        struct statistics *s = bpf_map_lookup_elem(&stats, &zero);
+        if (s) {
+            __sync_fetch_and_add(&s->nested_calls, 1);
+            // Diagnostic snapshots only; concurrent collisions may replace
+            // the last age/depth independently. No process IDs are exported.
+            s->nested_last_age_ns = bpf_ktime_get_ns() - active->started_ns;
+            s->nested_last_depth = active->depth;
+            __sync_fetch_and_or(&s->nested_kind_mask, 1ULL << kind);
+        }
         return 0;
     }
     struct call_state state = { .started_ns = bpf_ktime_get_ns(), .depth = 1 };
@@ -169,6 +196,7 @@ static __always_inline int enter_call(struct sock *sk, struct msghdr *msg, __u32
 static __always_inline void emit(struct sock *sk, struct socket *sock,
                                 struct call_state *state, __u8 kind)
 {
+    if (!ready()) return;
     __u64 id = incarnation(sk);
     if (!id) return;
     struct lifecycle_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -233,7 +261,12 @@ static __always_inline int leave_call(struct sock *sk, struct socket *sock,
     if (!saved) return 0;
     if (saved->depth > 1) { saved->depth--; return 0; }
     struct call_state state = *saved;
-    bpf_map_delete_elem(&pending, &key);
+    if (bpf_map_delete_elem(&pending, &key)) {
+        __u32 zero = 0;
+        struct statistics *s = bpf_map_lookup_elem(&stats, &zero);
+        if (s) __sync_fetch_and_add(&s->pending_delete_failures, 1);
+        return 0;
+    }
     if (state.nested || result < 0 || !sk || !supported(sk)) return 0;
     if (kind == RECV && msg) save_peer(&state, msg);
     emit(sk, sock, &state, kind == CONNECT6_KEY ? CONNECT : kind);

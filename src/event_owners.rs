@@ -63,6 +63,7 @@ pub(super) struct Owners {
     closed: HashMap<(u64, u64), u64>,
     lifetimes: HashMap<(u64, u64), Lifetime>,
     unsafe_until: u64,
+    quarantine_reason: Option<String>,
     limited: bool,
     updated_at: u64,
     bindings_limited: bool,
@@ -81,7 +82,7 @@ pub(super) enum Match {
 }
 
 impl Owners {
-    fn invalidate(&mut self, now: u64) {
+    fn invalidate(&mut self, now: u64, reason: &'static str) {
         self.records.clear();
         self.closed.clear();
         self.lifetimes.clear();
@@ -92,6 +93,7 @@ impl Owners {
         self.bindings.clear();
         self.bindings_limited = false;
         self.unsafe_until = self.unsafe_until.max(now.saturating_add(RETAIN));
+        self.quarantine_reason = Some(reason.into());
     }
 
     pub fn update(&mut self, events: Vec<Event>, lost: u64, now: u64, inventory: &Inventory) {
@@ -114,11 +116,11 @@ impl Owners {
             .map(|record| record.windows.len())
             .sum();
         if lost > 0 {
-            self.invalidate(now);
+            self.invalidate(now, "socket events lost");
         }
         let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         if ticks <= 0 {
-            self.invalidate(now);
+            self.invalidate(now, "process clock unavailable");
             return;
         }
         for event in events {
@@ -144,7 +146,7 @@ impl Owners {
                     && !self.lifetimes.contains_key(&socket_identity)
                 {
                     self.limited = true;
-                    self.invalidate(now);
+                    self.invalidate(now, "socket identity limit reached");
                     continue;
                 }
                 let lifetime = self.lifetimes.entry(socket_identity).or_default();
@@ -160,7 +162,7 @@ impl Owners {
                 continue;
             }
             if event.flags & 1 != 0 {
-                self.invalidate(now);
+                self.invalidate(now, "kernel or io_uring actor cannot be identified");
                 continue;
             }
             if event.tgid == 0
@@ -176,7 +178,7 @@ impl Owners {
             if self.lifetimes.len() >= MAX_RECORDS && !self.lifetimes.contains_key(&socket_identity)
             {
                 self.limited = true;
-                self.invalidate(now);
+                self.invalidate(now, "socket identity limit reached");
                 continue;
             }
             let lifetime = self.lifetimes.entry(socket_identity).or_default();
@@ -206,7 +208,7 @@ impl Owners {
             if event.kind == 4 {
                 if self.closed.len() >= MAX_RECORDS && !self.closed.contains_key(&socket_identity) {
                     self.limited = true;
-                    self.invalidate(now);
+                    self.invalidate(now, "socket identity limit reached");
                     continue;
                 }
                 let closed = self
@@ -249,7 +251,7 @@ impl Owners {
             };
             if self.records.len() >= MAX_RECORDS && !self.records.contains_key(&key) {
                 self.limited = true;
-                self.invalidate(now);
+                self.invalidate(now, "socket identity limit reached");
                 continue;
             }
             let name = String::from_utf8_lossy(
@@ -310,7 +312,7 @@ impl Owners {
             self.windows += 1;
             if self.windows > MAX_RECORDS {
                 self.limited = true;
-                self.invalidate(now);
+                self.invalidate(now, "socket event window limit reached");
             }
         }
         self.rebuild(now, inventory);
@@ -414,7 +416,7 @@ impl Owners {
         self.limited |= self.bindings_limited || self.bindings.values().any(Option::is_none);
         if self.namespaces.len() > MAX_NAMESPACES {
             self.limited = true;
-            self.invalidate(now);
+            self.invalidate(now, "socket namespace limit reached");
         }
     }
 
@@ -470,7 +472,23 @@ impl Owners {
     }
 
     pub fn suppressed(&self) -> bool {
-        self.limited() || self.unsafe_until > self.updated_at
+        self.suppression_reason().is_some()
+    }
+
+    pub fn describe_loss(&mut self, details: String) {
+        if self.quarantine_reason.as_deref() == Some("socket events lost") && !details.is_empty() {
+            self.quarantine_reason = Some(format!("socket events lost: {details}"));
+        }
+    }
+
+    pub fn suppression_reason(&self) -> Option<&str> {
+        if self.unsafe_until > self.updated_at {
+            self.quarantine_reason.as_deref()
+        } else if self.limited() {
+            Some("socket evidence index limit reached")
+        } else {
+            None
+        }
     }
 
     pub fn namespaces(&self) -> HashSet<u64> {
@@ -843,6 +861,7 @@ mod tests {
         let first = event(7, 8, 10_000_000, 15_000_000);
         let mut owners = Owners::default();
         owners.update(vec![first], 1, 20_000_000, &Inventory::new());
+        owners.describe_loss("kernel read=1".into());
         assert!(owners.suppressed());
         assert!(!owners.limited());
         assert!(owners.records.is_empty());
@@ -852,6 +871,10 @@ mod tests {
             ..first
         };
         owners.update(vec![during], 0, 24_000_000, &Inventory::new());
+        assert_eq!(
+            owners.suppression_reason(),
+            Some("socket events lost: kernel read=1")
+        );
         assert!(owners.records.is_empty());
         let after = Event {
             started_ns: 4_000_000_000,
@@ -859,6 +882,7 @@ mod tests {
             ..first
         };
         owners.update(vec![after], 0, 4_020_000_000, &Inventory::new());
+        assert_eq!(owners.suppression_reason(), None);
         assert!(matches!(
             resolve(&owners, 4_005_000_000, 4_006_000_000),
             Match::Owned(_)
