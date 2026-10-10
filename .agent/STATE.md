@@ -32,7 +32,9 @@
   [#13](https://github.com/itmitalles-de/nettop/issues/13) bounded packet-queue
   pressure under host load. Missing conntrack mappings never
   prove absence of NAT, and nettop does not change firewall rules.
-- Startup follow-up for #12 fixes libbpf callback yielding (negative return),
+- Startup follow-up [PR #14](https://github.com/itmitalles-de/nettop/pull/14)
+  merged as `5caf4cc` (implementation `12bae0e`), closing #12. It fixes
+  libbpf callback yielding (negative return),
   attaches exits before entries and arms metadata recording only after all
   links are installed. Bounded loss diagnostics persist through quarantine;
   pending-map deletion failures are checked. The system-dependent IPv6 cache
@@ -42,20 +44,25 @@
   nested-call losses unless recording remains disarmed until setup completes.
   All six VM live cases and capability/cleanup checks passed on the final
   build. Formatting, Clippy in both modes and 141 Rust tests (also 1.88.0)
-  passed. GitHub CI for the follow-up remains pending.
-- Extended UI and helper are installed on Linux 7.0 from this follow-up.
+  passed. PR #14 standard/extended/MSRV/audit CI and all five CodeQL analyses
+  passed; independent review found no material issues.
+- Local `main` is synchronized; the merged local/remote work branch was
+  removed. Extended UI and helper are installed on Linux 7.0 from this follow-up.
   Twelve fresh host starts showed no socket-event loss or ownership quarantine,
   known TX 3.85–4.05 MB/s and unknown TX 0–2.15 kB/s. Eleven samples had no
   packet overflow; one reported 438 packets at the flow limit without event
-  loss or loss of normal attribution (#13). Do not report that all host checks
+  loss or loss of normal attribution (#13). A final `--once` exited cleanly
+  with roughly 4 MiB/s TX and unknown RX/TX of 138/95 B/s.
+  Do not report that all host checks
   were overflow-free. The untracked-flow notice remains expected under #8.
   UI has no capabilities; helper is root:tim 0750 with the extended set.
   Verified SHA-256: UI `4ee579712ae9c9321ff6555f5a41e2aa482eb591fb534785de2e2443878f14ac`,
   helper `9a66ba48a869e8ba32bcfa1d9ae084a7c8c4a3f3601d96a12366c50778d22162`.
 - Private evidence and the dedicated QEMU guest are outside Git under
   `../nettop-review/issue-2/`; use generated VM wrappers/current PID files,
-  never stale ports. Retain evidence, stop the guest after validation, and keep
-  credentials and raw runtime snapshots out of Git.
+  never stale ports. The Linux 6.8.0-146 guest is stopped; process exit and SSH
+  closure were verified. Retain evidence and keep credentials and raw runtime
+  snapshots out of Git.
 
 ## Completed baseline
 
