@@ -220,9 +220,6 @@ impl Owners {
                 *closed = (*closed).min(event.timestamp_ns);
                 continue;
             }
-            if event.flags & 2 != 0 {
-                continue;
-            }
             let protocol = match event.protocol {
                 6 => Protocol::Tcp,
                 17 => Protocol::Udp,
@@ -231,11 +228,27 @@ impl Owners {
             let Some(local) = address(event.family, event.local_addr, event.local_port) else {
                 continue;
             };
-            let Some(remote) = address(event.family, event.remote_addr, event.remote_port) else {
+            let Some(mut remote) = address(event.family, event.remote_addr, event.remote_port)
+            else {
                 continue;
             };
-            if local.port() == 0 || remote.port() == 0 || remote.ip().is_unspecified() {
+            let peer_known =
+                event.flags & 2 == 0 && remote.port() != 0 && !remote.ip().is_unspecified();
+            if local.port() == 0 || (!peer_known && protocol != Protocol::Udp) {
                 continue;
+            }
+            if !peer_known {
+                // read()/recv() need not request the peer of an unconnected
+                // UDP socket. Preserve the actor and exact socket incarnation
+                // for endpoint packets, never invent tuple evidence from it.
+                remote = SocketAddr::new(
+                    if local.is_ipv4() {
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                    } else {
+                        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                    },
+                    0,
+                );
             }
             let identity = ProcessIdentity {
                 pid: event.tgid,
@@ -375,6 +388,9 @@ impl Owners {
                 } else {
                     keys.push(key.clone());
                 }
+            }
+            if key.remote.port() == 0 || key.remote.ip().is_unspecified() {
+                continue;
             }
             let candidates = self
                 .tuples
@@ -1491,6 +1507,112 @@ mod tests {
         owners.update(vec![close], 0, 35_000_000, &Inventory::new());
         assert!(
             matches!(lookup(&owners), Match::Owned(socket) if socket.owner().unwrap().identity.pid == 7)
+        );
+    }
+    #[test]
+    fn unknown_udp_peer_keeps_only_exact_socket_actor_evidence() {
+        let read = Event {
+            kind: 2,
+            flags: 2,
+            inode: 123,
+            remote_port: 0,
+            remote_addr: [0; 16],
+            ..event(7, 8, 10_000_000, 15_000_000)
+        };
+        let mut owners = Owners::default();
+        owners.update(vec![read], 0, 20_000_000, &Inventory::new());
+        assert!(
+            owners.tuples.is_empty(),
+            "unknown peer must never invent tuple matches"
+        );
+        let packet = PacketEvent {
+            timestamp_ns: 12_000_000,
+            socket_id: 8,
+            netns: 1,
+            inode: 123,
+            protocol: 17,
+            receive: 1,
+            ip_bytes: 1028,
+            ..PacketEvent::default()
+        };
+        assert!(
+            matches!(owners.resolve_packet(&packet),Match::Owned(socket) if socket.owner().unwrap().identity.pid==7)
+        );
+        assert!(matches!(
+            owners.resolve(
+                1,
+                Protocol::Udp,
+                "127.0.0.1:1234".parse().unwrap(),
+                "127.0.0.1:80".parse().unwrap(),
+                true,
+                TimedBytes {
+                    bytes: 1028,
+                    first: 12_000_000,
+                    last: 12_000_000
+                }
+            ),
+            Match::Missing
+        ));
+        let queued = PacketEvent {
+            timestamp_ns: 8_000_000,
+            ..packet
+        };
+        assert!(
+            matches!(owners.resolve_packet(&queued), Match::Observed(_)),
+            "outside-call packets require caller descriptor corroboration"
+        );
+        assert!(matches!(
+            owners.resolve_packet(&PacketEvent {
+                socket_id: 9,
+                ..packet
+            }),
+            Match::Missing
+        ));
+        assert!(matches!(
+            owners.resolve_packet(&PacketEvent {
+                inode: 124,
+                ..packet
+            }),
+            Match::Ambiguous
+        ));
+        owners.update(
+            vec![Event { tgid: 9, ..read }],
+            0,
+            21_000_000,
+            &Inventory::new(),
+        );
+        assert!(
+            matches!(owners.resolve_packet(&packet), Match::Ambiguous),
+            "unknown-peer actors still conflict on a shared socket"
+        );
+        owners.update(Vec::new(), 1, 22_000_000, &Inventory::new());
+        assert!(matches!(owners.resolve_packet(&packet), Match::Ambiguous));
+
+        let mut owners = Owners::default();
+        owners.update(
+            vec![
+                read,
+                Event {
+                    kind: 4,
+                    started_ns: 18_000_000,
+                    timestamp_ns: 18_000_000,
+                    ..read
+                },
+            ],
+            0,
+            20_000_000,
+            &Inventory::new(),
+        );
+        assert!(matches!(
+            owners.resolve_packet(&PacketEvent {
+                timestamp_ns: 19_000_000,
+                ..packet
+            }),
+            Match::Ambiguous
+        ));
+        assert!(
+            matches!(owners.resolve_packet(&queued), Match::Ambiguous),
+            "read alone cannot backdate a closed socket lifetime"
         );
     }
 }

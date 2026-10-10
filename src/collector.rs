@@ -866,13 +866,34 @@ impl Attribution {
                 .iter()
                 .find(|interface| interface.index == selected)
         });
+        let observed_foreign: HashSet<_> = if selected.is_some() {
+            self.counters
+                .connections
+                .iter()
+                .filter(|((link, key, identity), entry)| {
+                    key.namespace != self.inventory.host_namespace()
+                        && link_in_scope(*link, selected)
+                        && (now.duration_since(entry.counter.last_seen) <= RECENT_TRAFFIC
+                            || deltas
+                                .connections
+                                .contains_key(&(*link, key.clone(), *identity)))
+                })
+                .map(|((_, key, identity), _)| (key.clone(), *identity))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for socket in self
             .inventory
             .sockets
             .iter()
             .filter(|socket| socket.current)
         {
-            if !socket_in_scope(socket, scope) {
+            if !socket_in_scope(socket, scope, self.inventory.host_namespace())
+                && !socket.owner().is_some_and(|owner| {
+                    observed_foreign.contains(&(socket.key.clone(), owner.identity))
+                })
+            {
                 continue;
             }
             let owner = socket.owner();
@@ -1066,13 +1087,23 @@ fn link_in_scope(link: Link, selected: Option<u32>) -> bool {
 }
 
 /// `scope` is `None` for all interfaces, `Some(None)` for a vanished one.
-fn socket_in_scope(socket: &Socket, scope: Option<Option<&KernelInterface>>) -> bool {
+fn socket_in_scope(
+    socket: &Socket,
+    scope: Option<Option<&KernelInterface>>,
+    host_namespace: u64,
+) -> bool {
     let Some(selected) = scope else {
         return true;
     };
     let Some(interface) = selected else {
         return false;
     };
+    // Namespace-local loopback and wildcard bindings cannot prove that a
+    // socket serves a selected host link. Foreign endpoints are added below
+    // from counters with positive observations on that exact host interface.
+    if socket.key.namespace != host_namespace {
+        return false;
+    }
     let ip = canonical_ip(socket.key.local.ip());
     // A wildcard is a kernel-wide binding and can serve the selected interface.
     ip.is_unspecified() || interface_has_ip(interface, ip)
@@ -2091,5 +2122,90 @@ mod tests {
             attribution.counters.unattributed[&Link::plain(2)].bytes.rx,
             100
         );
+    }
+    #[test]
+    fn selected_host_links_seed_only_host_sockets_but_keep_foreign_capture_counters() {
+        let mut inventory = Inventory::new();
+        let host = inventory.host_namespace();
+        let owner = Owner {
+            identity: ProcessIdentity {
+                pid: 200,
+                start_time: 100,
+            },
+            user: "test".into(),
+            name: "container-service".into(),
+        };
+        for (inode, local) in [(200, "127.0.0.1:8080"), (201, "0.0.0.0:8081")] {
+            inventory.sockets.push(Socket {
+                key: SocketKey {
+                    namespace: host + 1,
+                    inode,
+                    protocol: Protocol::Tcp,
+                    local: local.parse().unwrap(),
+                    remote: "0.0.0.0:0".parse().unwrap(),
+                },
+                state: "LISTEN".into(),
+                uid: 1000,
+                owners: vec![owner.clone()],
+                observed: Instant::now(),
+                current: true,
+                ipv6_only: None,
+            });
+        }
+        let mut host_socket = inventory.sockets[0].clone();
+        host_socket.key.namespace = host;
+        host_socket.key.inode = 202;
+        host_socket.owners[0].identity.pid = 300;
+        inventory.sockets.push(host_socket);
+        let interfaces = vec![
+            interface(1, true, "127.0.0.1"),
+            interface(2, false, "192.0.2.1"),
+        ];
+        let mut attribution = Attribution::new(inventory, None);
+        let now = Instant::now();
+        let (all, _) = attribution.rows(None, &interfaces, now, 1.0, &Deltas::default(), true);
+        assert!(all.iter().any(|r| r.pid == Some(200) && r.connections == 2));
+        for selected in [1, 2] {
+            let (processes, connections) = attribution.rows(
+                Some(selected),
+                &interfaces,
+                now,
+                1.0,
+                &Deltas::default(),
+                true,
+            );
+            assert!(!processes.iter().any(|r| r.pid == Some(200)));
+            assert!(!connections.iter().any(|r| r.pid == Some(200)));
+        }
+        let (host_lo, _) =
+            attribution.rows(Some(1), &interfaces, now, 1.0, &Deltas::default(), true);
+        assert!(
+            host_lo
+                .iter()
+                .any(|r| r.pid == Some(300) && r.connections == 1)
+        );
+        let observed = attribution.inventory.sockets[0].clone();
+        assert!(attribution.counters.record_owned(
+            Link::plain(2),
+            &observed,
+            true,
+            Bytes { rx: 1028, tx: 0 },
+            now,
+            &mut attribution.deltas
+        ));
+        let (processes, connections) =
+            attribution.rows(Some(2), &interfaces, now, 1.0, &attribution.deltas, true);
+        assert!(processes.iter().any(|r| r.pid == Some(200)
+            && r.rx_bytes == 1028
+            && r.rx_rate == 1028.0
+            && r.connections == 1));
+        assert!(
+            connections
+                .iter()
+                .any(|r| r.pid == Some(200) && r.rx_bytes == 1028 && r.state == "LISTEN")
+        );
+        let (host_lo, _) =
+            attribution.rows(Some(1), &interfaces, now, 1.0, &attribution.deltas, true);
+        assert!(!host_lo.iter().any(|r| r.pid == Some(200)));
     }
 }
