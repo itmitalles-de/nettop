@@ -18,7 +18,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
+// Additive optional fields keep version 1: older releases ignore them and newer
+// releases fill missing fields with defaults.
 const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +95,27 @@ impl PlotColor {
     }
 }
 
+/// UI language. `Auto` follows LC_ALL, LC_MESSAGES or LANG at startup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Language {
+    #[default]
+    Auto,
+    En,
+    De,
+}
+
+impl Language {
+    pub fn next(self, direction: i32) -> Self {
+        let choices = [Self::Auto, Self::En, Self::De];
+        let index = choices
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        choices[(index as i64 + i64::from(direction)).rem_euclid(choices.len() as i64) as usize]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
@@ -120,6 +144,25 @@ pub struct Settings {
     pub connections: bool,
     pub sort: SortKey,
     pub show_idle: bool,
+    pub language: Language,
+}
+
+/// One user preference, used to persist only what the user changed at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Field {
+    Interface,
+    IntervalMs,
+    HistorySeconds,
+    Bits,
+    Color,
+    ShowGraph,
+    GraphStyle,
+    RxColor,
+    TxColor,
+    Connections,
+    Sort,
+    ShowIdle,
+    Language,
 }
 
 impl Default for Settings {
@@ -138,11 +181,73 @@ impl Default for Settings {
             connections: false,
             sort: SortKey::Traffic,
             show_idle: true,
+            language: Language::Auto,
         }
     }
 }
 
 impl Settings {
+    /// Preferences whose values differ between both settings.
+    pub fn differing(&self, other: &Self) -> Vec<Field> {
+        // Exhaustive destructuring makes a new preference a compile error here
+        // until it is also handled by `copy_field`.
+        let Self {
+            version: _,
+            interface,
+            interval_ms,
+            history_seconds,
+            bits,
+            color,
+            show_graph,
+            graph_style,
+            rx_color,
+            tx_color,
+            connections,
+            sort,
+            show_idle,
+            language,
+        } = self;
+        [
+            (Field::Interface, *interface != other.interface),
+            (Field::IntervalMs, *interval_ms != other.interval_ms),
+            (
+                Field::HistorySeconds,
+                *history_seconds != other.history_seconds,
+            ),
+            (Field::Bits, *bits != other.bits),
+            (Field::Color, *color != other.color),
+            (Field::ShowGraph, *show_graph != other.show_graph),
+            (Field::GraphStyle, *graph_style != other.graph_style),
+            (Field::RxColor, *rx_color != other.rx_color),
+            (Field::TxColor, *tx_color != other.tx_color),
+            (Field::Connections, *connections != other.connections),
+            (Field::Sort, *sort != other.sort),
+            (Field::ShowIdle, *show_idle != other.show_idle),
+            (Field::Language, *language != other.language),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
+    }
+
+    pub fn copy_field(&mut self, from: &Self, field: Field) {
+        match field {
+            Field::Interface => self.interface.clone_from(&from.interface),
+            Field::IntervalMs => self.interval_ms = from.interval_ms,
+            Field::HistorySeconds => self.history_seconds = from.history_seconds,
+            Field::Bits => self.bits = from.bits,
+            Field::Color => self.color = from.color,
+            Field::ShowGraph => self.show_graph = from.show_graph,
+            Field::GraphStyle => self.graph_style = from.graph_style,
+            Field::RxColor => self.rx_color = from.rx_color,
+            Field::TxColor => self.tx_color = from.tx_color,
+            Field::Connections => self.connections = from.connections,
+            Field::Sort => self.sort = from.sort,
+            Field::ShowIdle => self.show_idle = from.show_idle,
+            Field::Language => self.language = from.language,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != VERSION {
             bail!(
@@ -169,6 +274,42 @@ impl Settings {
         }
         Ok(())
     }
+}
+
+/// Loaded preferences plus top-level keys that this version does not know.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Loaded {
+    pub settings: Settings,
+    pub unknown_keys: Vec<String>,
+}
+
+/// Saving or loading as root in another user's settings directory, typically
+/// after `sudo -E nettop`, would create root-owned files there.
+#[derive(Debug)]
+pub struct RootWithForeignSettings;
+
+impl std::fmt::Display for RootWithForeignSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "nettop runs as root, but the settings directory belongs to another user \
+             (for example after sudo -E); start nettop without sudo to change preferences",
+        )
+    }
+}
+
+impl std::error::Error for RootWithForeignSettings {}
+
+struct Stored {
+    settings: Settings,
+    extra: Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct StoredRef<'a> {
+    #[serde(flatten)]
+    settings: &'a Settings,
+    #[serde(flatten)]
+    extra: &'a Map<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +343,12 @@ impl ConfigFile {
     }
 
     pub fn load(&self) -> Result<Settings> {
+        Ok(self.load_with_unknown_keys()?.settings)
+    }
+
+    /// Load settings and also report keys this version does not understand.
+    /// Unknown keys are kept when saving, so typos and newer options survive F12.
+    pub fn load_with_unknown_keys(&self) -> Result<Loaded> {
         self.load_inner().with_context(|| {
             format!(
                 "cannot load {}; fix or move this settings file to use defaults",
@@ -210,19 +357,29 @@ impl ConfigFile {
         })
     }
 
-    fn load_inner(&self) -> Result<Settings> {
+    fn load_inner(&self) -> Result<Loaded> {
         let (parent, name) = self.location()?;
         let directory = match open_directory(parent) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Loaded::default());
+            }
             Err(error) => return Err(error.into()),
         };
         validate_directory(&directory)?;
-        Ok(read_settings(&directory, &name)?.unwrap_or_default())
+        Ok(read_settings(&directory, &name)?
+            .map(|stored| Loaded {
+                unknown_keys: stored.extra.keys().cloned().collect(),
+                settings: stored.settings,
+            })
+            .unwrap_or_default())
     }
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
         settings.validate()?;
+        let (parent, _) = self.location()?;
+        // SAFETY: geteuid has no preconditions and does not modify process state.
+        refuse_foreign_directory_as_root(parent, unsafe { libc::geteuid() })?;
         self.save_inner(settings).with_context(|| {
             format!(
                 "cannot save {}; existing settings have not been intentionally discarded",
@@ -240,8 +397,13 @@ impl ConfigFile {
         let directory = open_directory(parent)?;
         validate_directory(&directory)?;
         // Never replace an unreadable, malformed, unsupported, or unsafe file.
-        read_settings(&directory, &name)?;
-        let mut bytes = serde_json::to_vec_pretty(settings)?;
+        let extra = read_settings(&directory, &name)?
+            .map(|stored| stored.extra)
+            .unwrap_or_default();
+        let mut bytes = serde_json::to_vec_pretty(&StoredRef {
+            settings,
+            extra: &extra,
+        })?;
         bytes.push(b'\n');
         if bytes.len() as u64 > MAX_BYTES {
             bail!("serialized settings exceed 64 KiB");
@@ -292,16 +454,43 @@ fn open_directory(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// As root, never create or write settings below a directory owned by another
+/// user: the result would be root-owned and break that user's normal starts.
+fn refuse_foreign_directory_as_root(parent: &Path, euid: libc::uid_t) -> Result<()> {
+    if euid != 0 {
+        return Ok(());
+    }
+    // The nearest existing ancestor decides who would own new directories.
+    for ancestor in parent.ancestors() {
+        let ancestor = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match fs::metadata(ancestor) {
+            Ok(metadata) if metadata.uid() != 0 => return Err(RootWithForeignSettings.into()),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn validate_directory(directory: &File) -> Result<()> {
     let metadata = directory.metadata()?;
     // SAFETY: geteuid has no preconditions and does not modify process state.
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 && metadata.uid() != 0 {
+        return Err(RootWithForeignSettings.into());
+    }
+    if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
         bail!("settings directory must be user-owned and not writable by other users");
     }
     Ok(())
 }
 
-fn read_settings(directory: &File, name: &CStr) -> Result<Option<Settings>> {
+fn read_settings(directory: &File, name: &CStr) -> Result<Option<Stored>> {
     // O_NOFOLLOW rejects the file itself being a symlink; O_NONBLOCK prevents an
     // unsafe FIFO from blocking before its file type can be inspected.
     // SAFETY: name is a valid C string and directory owns an open directory fd.
@@ -340,9 +529,17 @@ fn read_settings(directory: &File, name: &CStr) -> Result<Option<Settings>> {
     if bytes.len() as u64 > MAX_BYTES {
         bail!("settings file exceeds 64 KiB");
     }
-    let settings: Settings = serde_json::from_slice(&bytes).context("invalid settings JSON")?;
+    let value: Value = serde_json::from_slice(&bytes).context("invalid settings JSON")?;
+    let settings = Settings::deserialize(&value).context("invalid settings JSON")?;
     settings.validate()?;
-    Ok(Some(settings))
+    let Value::Object(mut extra) = value else {
+        bail!("invalid settings JSON: expected an object");
+    };
+    let known = serde_json::to_value(Settings::default())?;
+    if let Value::Object(known) = known {
+        extra.retain(|key, _| !known.contains_key(key));
+    }
+    Ok(Some(Stored { settings, extra }))
 }
 
 struct TemporaryFile<'a> {
@@ -543,6 +740,96 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(config.load().is_err());
         assert!(config.save(&Settings::default()).is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_and_preserved_when_saving() {
+        let directory = TestDirectory::new();
+        let config = directory.config();
+        config.save(&Settings::default()).unwrap();
+        fs::write(
+            config.path(),
+            br#"{"bits": true, "colour": false, "future": {"nested": [1, 2]}}"#,
+        )
+        .unwrap();
+        let loaded = config.load_with_unknown_keys().unwrap();
+        assert!(loaded.settings.bits);
+        assert_eq!(loaded.unknown_keys, ["colour", "future"]);
+        let changed = Settings {
+            history_seconds: 120,
+            ..loaded.settings
+        };
+        config.save(&changed).unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(config.path()).unwrap()).unwrap();
+        assert_eq!(saved["colour"], Value::Bool(false));
+        assert_eq!(saved["future"]["nested"][1], 2);
+        assert_eq!(saved["history_seconds"], 120);
+        let reloaded = config.load_with_unknown_keys().unwrap();
+        assert_eq!(reloaded.settings, changed);
+        assert_eq!(reloaded.unknown_keys, ["colour", "future"]);
+        // Known preferences always come from the saved settings, never extras.
+        assert_eq!(saved["version"], 1);
+    }
+
+    #[test]
+    fn language_defaults_to_auto_and_older_files_stay_compatible() {
+        let directory = TestDirectory::new();
+        let config = directory.config();
+        config.save(&Settings::default()).unwrap();
+        fs::write(config.path(), br#"{"version": 1, "bits": true}"#).unwrap();
+        assert_eq!(config.load().unwrap().language, Language::Auto);
+        fs::write(config.path(), br#"{"version": 1, "language": "de"}"#).unwrap();
+        assert_eq!(config.load().unwrap().language, Language::De);
+        fs::write(config.path(), br#"{"version": 1, "language": "fr"}"#).unwrap();
+        assert!(config.load().is_err());
+        assert_eq!(Language::Auto.next(1), Language::En);
+        assert_eq!(Language::Auto.next(-1), Language::De);
+    }
+
+    #[test]
+    fn root_refuses_settings_below_another_users_directory() {
+        let directory = TestDirectory::new();
+        let nested = directory.0.join("missing/nettop");
+        // Ordinary users are never affected by the root-only refusal.
+        assert!(refuse_foreign_directory_as_root(&nested, 1000).is_ok());
+        let owner = fs::metadata(&directory.0).unwrap().uid();
+        let result = refuse_foreign_directory_as_root(&nested, 0);
+        if owner == 0 {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<RootWithForeignSettings>().is_some());
+            assert!(error.to_string().contains("without sudo"));
+            assert!(
+                !nested.exists(),
+                "refusal must happen before creating directories"
+            );
+        }
+    }
+
+    #[test]
+    fn differing_fields_copy_only_selected_preferences() {
+        let saved = Settings {
+            interface: Some("eth0".into()),
+            ..Settings::default()
+        };
+        let runtime = Settings {
+            interface: None,
+            bits: true,
+            color: false,
+            language: Language::De,
+            ..saved.clone()
+        };
+        assert_eq!(
+            runtime.differing(&saved),
+            [Field::Interface, Field::Bits, Field::Color, Field::Language]
+        );
+        let mut merged = saved.clone();
+        merged.copy_field(&runtime, Field::Bits);
+        assert!(merged.bits);
+        assert!(merged.color);
+        assert_eq!(merged.interface.as_deref(), Some("eth0"));
+        assert_eq!(merged.differing(&saved), [Field::Bits]);
     }
 
     #[test]

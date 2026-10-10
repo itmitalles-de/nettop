@@ -75,6 +75,26 @@ fn retain(allowed: u64) -> Result<()> {
     Ok(())
 }
 
+/// Replace the inherited environment with `LANG=C`, as when the UI launches
+/// the helper. The installed helper has file capabilities even when executed
+/// directly, and libraries loaded by libpcap may read variables with plain
+/// getenv rather than secure_getenv (libibverbs honors RDMAV_DRIVERS and
+/// IBV_DRIVERS, for example), so this must run before libpcap is loaded.
+///
+/// # Safety
+///
+/// The process must still be single-threaded: no other thread may read or
+/// modify the environment concurrently.
+pub unsafe fn reset_environment() -> Result<()> {
+    // SAFETY: guaranteed single-threaded by the caller.
+    if unsafe { libc::clearenv() } != 0 {
+        bail!("cannot clear the helper environment");
+    }
+    // SAFETY: guaranteed single-threaded by the caller.
+    unsafe { std::env::set_var("LANG", "C") };
+    Ok(())
+}
+
 /// Called by the capture worker itself, after opening its packet socket.
 pub fn drop_capture_privileges() -> Result<()> {
     retain(0)
@@ -88,6 +108,44 @@ pub fn retain_process_read_privileges() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_environment_removes_injected_variables() {
+        const CHILD: &str = "NETTOP_TEST_RESET_ENVIRONMENT_CHILD";
+        const NAME: &str = "privilege::tests::reset_environment_removes_injected_variables";
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: this re-executed test process runs only this test on one
+            // test thread, and nothing else touches the environment meanwhile.
+            unsafe { reset_environment() }.unwrap();
+            let remaining: Vec<_> = std::env::vars_os().collect();
+            assert_eq!(remaining, [("LANG".into(), "C".into())]);
+            for name in [
+                c"RDMAV_DRIVERS",
+                c"IBV_DRIVERS",
+                c"LD_LIBRARY_PATH",
+                c"PATH",
+            ] {
+                // SAFETY: getenv reads a valid C string; no concurrent writers.
+                assert!(unsafe { libc::getenv(name.as_ptr()) }.is_null());
+            }
+            return;
+        }
+        // Clearing the environment would affect other tests in this process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("RDMAV_DRIVERS", "/tmp/nettop-test-injected")
+            .env("IBV_DRIVERS", "/tmp/nettop-test-injected")
+            .env("LD_LIBRARY_PATH", "/tmp/nettop-test-injected")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "child test did not run: {stdout}"
+        );
+    }
 
     #[test]
     fn capture_thread_drops_all_capabilities_without_changing_parent() {

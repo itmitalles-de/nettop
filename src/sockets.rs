@@ -12,6 +12,14 @@ const MAX_SOCKETS: usize = 32_768;
 const MAX_PROCESSES: usize = 32_768;
 const MAX_FD_LINKS: usize = 262_144;
 const RETAIN_CLOSED: Duration = Duration::from_secs(3);
+/// Socket tables are reread at most this often, below the collector's
+/// background attribution cadence.
+const MIN_REFRESH: Duration = Duration::from_millis(200);
+const MIN_OWNER_SCAN_GAP: Duration = Duration::from_millis(200);
+const FULL_OWNER_RESCAN: Duration = Duration::from_secs(5);
+const OWNER_CHECK: Duration = Duration::from_secs(1);
+const DIAG_DEADLINE: Duration = Duration::from_millis(50);
+const DIAG_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ProcessIdentity {
@@ -19,7 +27,7 @@ pub(super) struct ProcessIdentity {
     pub start_time: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Owner {
     pub identity: ProcessIdentity,
     pub user: String,
@@ -57,16 +65,42 @@ impl Socket {
     }
 }
 
+/// Outcome of matching one flow endpoint against the socket inventory.
+pub(super) enum Resolution<'a> {
+    /// Exactly one best socket with a single owning process.
+    Owned(&'a Socket),
+    /// The best socket is new and its owner has not been scanned yet.
+    Pending,
+    /// No, an ambiguous, or a shared/ownerless match.
+    Unattributed,
+}
+
+type ExactKey = (Protocol, SocketAddr, SocketAddr);
+
 pub(super) struct Inventory {
     pub sockets: Vec<Socket>,
     pub users: HashMap<u32, String>,
+    /// Some socket tables or process descriptors were inaccessible during the
+    /// latest table refresh or owner scan (not "ever since startup").
     pub restricted: bool,
+    /// A socket, process or descriptor bound was hit during the latest table
+    /// refresh or owner scan.
     pub limited: bool,
-    index: HashMap<(Protocol, u16), Vec<usize>>,
+    /// Connected sockets by their full endpoint pair: one lookup per flow
+    /// instead of scanning every connection sharing a busy local port.
+    exact: HashMap<ExactKey, Vec<usize>>,
+    /// Listeners, unconnected and wildcard sockets by local port.
+    by_port: HashMap<(Protocol, u16), Vec<usize>>,
     owners: HashMap<u64, Vec<Owner>>,
     owner_keys: HashMap<u64, SocketKey>,
+    owner_flags: (bool, bool),
+    owners_stale: bool,
+    owner_scan_cost: Duration,
+    ipv6_modes: HashMap<SocketKey, bool>,
+    ipv6_attempts: HashMap<SocketKey, Instant>,
     last_scan: Option<Instant>,
     last_owner_scan: Option<Instant>,
+    last_owner_check: Option<Instant>,
 }
 
 impl Inventory {
@@ -87,11 +121,18 @@ impl Inventory {
             users,
             restricted: false,
             limited: false,
-            index: HashMap::new(),
+            exact: HashMap::new(),
+            by_port: HashMap::new(),
             owners: HashMap::new(),
             owner_keys: HashMap::new(),
+            owner_flags: (false, false),
+            owners_stale: false,
+            owner_scan_cost: Duration::ZERO,
+            ipv6_modes: HashMap::new(),
+            ipv6_attempts: HashMap::new(),
             last_scan: None,
             last_owner_scan: None,
+            last_owner_check: None,
         }
     }
 
@@ -99,10 +140,12 @@ impl Inventory {
         let now = Instant::now();
         if self
             .last_scan
-            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(500))
+            .is_some_and(|last| now.duration_since(last) < MIN_REFRESH)
         {
             return;
         }
+        let mut restricted = false;
+        let mut limited = false;
         let mut current = Vec::new();
         for (path, protocol, ipv6) in [
             ("/proc/net/tcp", Protocol::Tcp, false),
@@ -114,7 +157,7 @@ impl Inventory {
                 Ok(contents) => {
                     for line in contents.lines().skip(1) {
                         if current.len() >= MAX_SOCKETS {
-                            self.limited = true;
+                            limited = true;
                             break;
                         }
                         if let Some(socket) = parse_socket(line, protocol, ipv6, now) {
@@ -123,30 +166,12 @@ impl Inventory {
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    self.restricted = true
+                    restricted = true
                 }
                 Err(_) => {}
             }
         }
-        let live_inodes: HashSet<_> = current
-            .iter()
-            .map(|socket| socket.key.inode)
-            .filter(|inode| *inode != 0)
-            .collect();
-        if self
-            .last_owner_scan
-            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
-        {
-            let (owners, restricted, limited) = scan_owners(&live_inodes, &self.users);
-            self.owners = owners;
-            self.owner_keys = current
-                .iter()
-                .map(|socket| (socket.key.inode, socket.key.clone()))
-                .collect();
-            self.restricted |= restricted;
-            self.limited |= limited;
-            self.last_owner_scan = Some(now);
-        }
+        self.refresh_owners(&current, now);
         for socket in &mut current {
             // An inode reused for a different endpoint must not inherit stale
             // cached ownership before the next bounded descriptor scan.
@@ -158,14 +183,14 @@ impl Inventory {
                     .unwrap_or_default();
             }
         }
-        let ipv6_modes = ipv6_socket_modes(&current);
+        self.refresh_ipv6_modes(&current, now);
         for socket in &mut current {
-            socket.ipv6_only = ipv6_modes.get(&socket.key).copied();
+            socket.ipv6_only = self.ipv6_modes.get(&socket.key).copied();
         }
         let live_keys: HashSet<_> = current.iter().map(|socket| socket.key.clone()).collect();
         for mut socket in self.sockets.drain(..) {
             if current.len() >= MAX_SOCKETS {
-                self.limited = true;
+                limited = true;
                 break;
             }
             if !live_keys.contains(&socket.key)
@@ -176,14 +201,120 @@ impl Inventory {
             }
         }
         self.sockets = current;
-        self.index.clear();
-        for (index, socket) in self.sockets.iter().enumerate() {
-            self.index
-                .entry((socket.key.protocol, socket.key.local.port()))
-                .or_default()
-                .push(index);
-        }
+        self.rebuild_index();
+        let (owner_restricted, owner_limited) = self.owner_flags;
+        self.restricted = restricted || owner_restricted;
+        self.limited = limited || owner_limited;
         self.last_scan = Some(now);
+    }
+
+    /// Descriptor scans are the expensive part. Scan promptly when sockets
+    /// without a scanned owner appear or a cached owner exited, but never more
+    /// often than a gap proportional to the previous scan's cost; otherwise
+    /// rescan only periodically to notice inherited or passed descriptors.
+    fn refresh_owners(&mut self, current: &[Socket], now: Instant) {
+        if self
+            .last_owner_check
+            .is_none_or(|last| now.saturating_duration_since(last) >= OWNER_CHECK)
+        {
+            // Cheap PID-reuse protection between full scans: drop owners whose
+            // process exited or whose PID now belongs to another process.
+            self.owners_stale |= remove_exited_owners(&mut self.owners);
+            self.last_owner_check = Some(now);
+        }
+        let unscanned = current.iter().any(|socket| {
+            socket.key.inode != 0 && self.owner_keys.get(&socket.key.inode) != Some(&socket.key)
+        });
+        let gap = (self.owner_scan_cost * 10).clamp(MIN_OWNER_SCAN_GAP, FULL_OWNER_RESCAN);
+        let due = self.last_owner_scan.is_none_or(|last| {
+            let since = now.saturating_duration_since(last);
+            since >= FULL_OWNER_RESCAN || ((unscanned || self.owners_stale) && since >= gap)
+        });
+        if !due {
+            return;
+        }
+        let live_inodes: HashSet<_> = current
+            .iter()
+            .map(|socket| socket.key.inode)
+            .filter(|inode| *inode != 0)
+            .collect();
+        let started = Instant::now();
+        let (owners, restricted, limited) = scan_owners(&live_inodes, &self.users);
+        self.owner_scan_cost = started.elapsed();
+        self.owners = owners;
+        self.owner_keys = current
+            .iter()
+            .filter(|socket| socket.key.inode != 0)
+            .map(|socket| (socket.key.inode, socket.key.clone()))
+            .collect();
+        self.owner_flags = (restricted, limited);
+        self.owners_stale = false;
+        self.last_owner_scan = Some(now);
+        self.last_owner_check = Some(now);
+    }
+
+    /// IPV6_V6ONLY cannot change after bind, so results are cached per socket
+    /// incarnation and only new wildcard sockets are queried. Failed lookups
+    /// are retried after a pause instead of on every refresh.
+    fn refresh_ipv6_modes(&mut self, current: &[Socket], now: Instant) {
+        let wanted: HashMap<&SocketKey, u32> = current
+            .iter()
+            .filter(|socket| socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            .map(|socket| (&socket.key, state_mask(&socket.state, socket.key.protocol)))
+            .collect();
+        self.ipv6_modes.retain(|key, _| wanted.contains_key(key));
+        self.ipv6_attempts.retain(|key, _| wanted.contains_key(key));
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            let mut states = 0;
+            let mut missing = HashSet::new();
+            for (&key, &mask) in &wanted {
+                if key.protocol == protocol
+                    && !self.ipv6_modes.contains_key(key)
+                    && self
+                        .ipv6_attempts
+                        .get(key)
+                        .is_none_or(|last| now.saturating_duration_since(*last) >= DIAG_RETRY)
+                {
+                    missing.insert(key.clone());
+                    states |= mask;
+                }
+            }
+            if missing.is_empty() {
+                continue;
+            }
+            // Each protocol has its own deadline; a slow TCP dump cannot starve UDP.
+            read_ipv6_modes(
+                protocol,
+                states,
+                &missing,
+                &mut self.ipv6_modes,
+                Instant::now() + DIAG_DEADLINE,
+            );
+            for key in missing {
+                if !self.ipv6_modes.contains_key(&key) {
+                    self.ipv6_attempts.insert(key, now);
+                }
+            }
+        }
+    }
+
+    pub(super) fn rebuild_index(&mut self) {
+        self.exact.clear();
+        self.by_port.clear();
+        for (index, socket) in self.sockets.iter().enumerate() {
+            let key = &socket.key;
+            if !key.local.ip().is_unspecified() && !key.remote.ip().is_unspecified() {
+                self.exact
+                    .entry((key.protocol, key.local, key.remote))
+                    .or_default()
+                    .push(index);
+            } else {
+                self.by_port
+                    .entry((key.protocol, key.local.port()))
+                    .or_default()
+                    .push(index);
+            }
+        }
     }
 
     /// Exact connected sockets outrank listeners. Tied inodes or shared owners
@@ -193,18 +324,47 @@ impl Inventory {
         protocol: Protocol,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<&Socket> {
-        let candidates = self.index.get(&(protocol, local.port()))?;
+    ) -> Resolution<'_> {
+        let exact = self
+            .exact
+            .get(&(protocol, local, remote))
+            .map_or(&[][..], Vec::as_slice);
+        let wildcard = self
+            .by_port
+            .get(&(protocol, local.port()))
+            .map_or(&[][..], Vec::as_slice);
+        // After a local close the kernel keeps the same endpoint pair without
+        // an inode (FIN-WAIT, TIME-WAIT, LAST-ACK). That remnant continues the
+        // retained socket; it is not a competing incarnation.
+        let continued = exact.iter().any(|&index| {
+            let socket = &self.sockets[index];
+            !socket.current && socket.key.inode != 0
+        });
         let mut best = None;
         let mut best_score = 0;
         let mut ambiguous = false;
         let mut matching_incarnations = 0;
         let mut retained_match = false;
-        for &index in candidates {
+        let candidates = exact
+            .iter()
+            .map(|&index| (index, true))
+            .chain(wildcard.iter().map(|&index| (index, false)));
+        let mut exact_match = false;
+        for (index, is_exact) in candidates {
             let socket = &self.sockets[index];
+            if is_exact && continued && closing_remnant(socket) {
+                continue;
+            }
+            // Segments of an existing TCP connection never reach a listener on
+            // the same port (they go to the connection or its TIME-WAIT
+            // remnant), so a listener is no competing incarnation for them.
+            if exact_match && protocol == Protocol::Tcp && socket.state == "LISTEN" {
+                continue;
+            }
             let Some(score) = match_score(socket, local, remote) else {
                 continue;
             };
+            exact_match |= is_exact;
             matching_incarnations += 1;
             retained_match |= !socket.current;
             if score > best_score {
@@ -221,10 +381,21 @@ impl Inventory {
         // both match, even after both have closed: a retained connected socket
         // must not steal a later wildcard socket's packets, or vice versa.
         if ambiguous || (retained_match && matching_incarnations > 1) {
-            None
-        } else {
-            best.filter(|socket| socket.owner().is_some())
+            return Resolution::Unattributed;
         }
+        match best {
+            Some(socket) if socket.owner().is_some() => Resolution::Owned(socket),
+            Some(socket) if self.awaiting_owner(socket) => Resolution::Pending,
+            _ => Resolution::Unattributed,
+        }
+    }
+
+    /// A live socket whose inode has not been part of a descriptor scan yet.
+    fn awaiting_owner(&self, socket: &Socket) -> bool {
+        socket.current
+            && socket.key.inode != 0
+            && socket.owners.is_empty()
+            && self.owner_keys.get(&socket.key.inode) != Some(&socket.key)
     }
 
     pub(super) fn user(&self, uid: u32) -> String {
@@ -233,6 +404,53 @@ impl Inventory {
             .cloned()
             .unwrap_or_else(|| uid.to_string())
     }
+}
+
+fn closing_remnant(socket: &Socket) -> bool {
+    socket.current
+        && socket.key.inode == 0
+        && socket.owners.is_empty()
+        && matches!(
+            socket.state.as_str(),
+            "FIN-WAIT-1" | "FIN-WAIT-2" | "TIME-WAIT" | "CLOSE" | "LAST-ACK" | "CLOSING"
+        )
+}
+
+fn remove_exited_owners(owners: &mut HashMap<u64, Vec<Owner>>) -> bool {
+    let identities: HashSet<ProcessIdentity> = owners
+        .values()
+        .flatten()
+        .map(|owner| owner.identity)
+        .collect();
+    let exited: HashSet<_> = identities
+        .into_iter()
+        .filter(|identity| {
+            fs::read_to_string(format!("/proc/{}/stat", identity.pid))
+                .ok()
+                .and_then(|stat| start_time(&stat))
+                != Some(identity.start_time)
+        })
+        .collect();
+    if exited.is_empty() {
+        return false;
+    }
+    for entries in owners.values_mut() {
+        entries.retain(|owner| !exited.contains(&owner.identity));
+    }
+    true
+}
+
+/// SOCK_DIAG state bit for a socket table state label.
+fn state_mask(label: &str, protocol: Protocol) -> u32 {
+    let state = if protocol == Protocol::Udp {
+        // Unconnected UDP sockets are TCP_CLOSE; connected ones TCP_ESTABLISHED.
+        if label == "CONNECTED" { 1 } else { 7 }
+    } else {
+        (1..=12)
+            .find(|state| state_label(*state, protocol) == label)
+            .unwrap_or(10)
+    };
+    1 << state
 }
 
 fn match_score(socket: &Socket, local: SocketAddr, remote: SocketAddr) -> Option<u8> {
@@ -264,25 +482,12 @@ fn match_score(socket: &Socket, local: SocketAddr, remote: SocketAddr) -> Option
 
 /// SOCK_DIAG exposes IPV6_V6ONLY without opening another process's descriptor.
 /// Only wildcard IPv6 sockets need it; a denied/unsupported query leaves IPv4
-/// attribution unknown. Bound both elapsed time and retained response data.
-fn ipv6_socket_modes(sockets: &[Socket]) -> HashMap<SocketKey, bool> {
-    let wanted: HashSet<_> = sockets
-        .iter()
-        .filter(|socket| socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED))
-        .map(|socket| socket.key.clone())
-        .collect();
-    let mut modes = HashMap::new();
-    let deadline = Instant::now() + Duration::from_millis(50);
-    for protocol in [Protocol::Tcp, Protocol::Udp] {
-        if wanted.iter().any(|key| key.protocol == protocol) {
-            read_ipv6_modes(protocol, &wanted, &mut modes, deadline);
-        }
-    }
-    modes
-}
-
+/// attribution unknown. The kernel filters by state (listeners for TCP,
+/// unconnected sockets for UDP), and both elapsed time and retained response
+/// data are bounded.
 fn read_ipv6_modes(
     protocol: Protocol,
+    states: u32,
     wanted: &HashSet<SocketKey>,
     modes: &mut HashMap<SocketKey, bool>,
     deadline: Instant,
@@ -307,7 +512,7 @@ fn read_ipv6_modes(
     request[8..12].copy_from_slice(&1_u32.to_ne_bytes());
     request[16] = libc::AF_INET6 as u8;
     request[17] = if protocol == Protocol::Tcp { 6 } else { 17 };
-    request[20..24].copy_from_slice(&u32::MAX.to_ne_bytes()); // All states.
+    request[20..24].copy_from_slice(&states.to_ne_bytes());
     request[64..72].fill(0xff); // INET_DIAG_NOCOOKIE
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -681,81 +886,247 @@ mod tests {
         );
     }
 
+    fn resolved_pid(resolution: Resolution<'_>) -> Option<u32> {
+        match resolution {
+            Resolution::Owned(socket) => Some(socket.owner().unwrap().identity.pid),
+            Resolution::Pending | Resolution::Unattributed => None,
+        }
+    }
+
+    fn inventory_with(sockets: Vec<Socket>) -> Inventory {
+        let mut inventory = Inventory::new();
+        inventory.sockets = sockets;
+        inventory.rebuild_index();
+        inventory
+    }
+
     #[test]
     fn ambiguous_and_shared_sockets_do_not_get_a_pid() {
-        let mut inventory = Inventory::new();
-        for inode in [1, 2] {
-            inventory.sockets.push(Socket {
-                key: key("0.0.0.0:443", "0.0.0.0:0", inode),
-                state: "LISTEN".to_string(),
-                uid: 1000,
-                owners: vec![Owner {
-                    identity: ProcessIdentity {
-                        pid: inode as u32,
-                        start_time: 100,
-                    },
-                    user: "test".to_string(),
-                    name: "test".to_string(),
-                }],
-                observed: Instant::now(),
-                current: true,
-                ipv6_only: None,
-            });
-        }
-        inventory.index.insert((Protocol::Tcp, 443), vec![0, 1]);
-        assert!(
-            inventory
-                .resolve(
-                    Protocol::Tcp,
-                    "192.0.2.1:443".parse().unwrap(),
-                    "198.51.100.2:23456".parse().unwrap()
-                )
-                .is_none()
+        let local = "192.0.2.1:443".parse().unwrap();
+        let remote = "198.51.100.2:23456".parse().unwrap();
+        let mut inventory = inventory_with(
+            [1, 2]
+                .map(|inode| {
+                    owned_socket(key("0.0.0.0:443", "0.0.0.0:0", inode), inode as u32, true)
+                })
+                .into(),
         );
-        inventory.index.insert((Protocol::Tcp, 443), vec![0]);
+        assert!(resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)).is_none());
         let shared_owner = inventory.sockets[1].owners[0].clone();
+        inventory.sockets.truncate(1);
         inventory.sockets[0].owners.push(shared_owner);
-        assert!(
-            inventory
-                .resolve(
-                    Protocol::Tcp,
-                    "192.0.2.1:443".parse().unwrap(),
-                    "198.51.100.2:23456".parse().unwrap()
-                )
-                .is_none()
-        );
+        inventory.rebuild_index();
+        assert!(resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)).is_none());
     }
 
     #[test]
     fn retained_connected_socket_cannot_steal_rebound_wildcard_traffic() {
         for protocol in [Protocol::Tcp, Protocol::Udp] {
             for current in [true, false] {
-                let mut inventory = Inventory::new();
-                inventory.sockets = vec![
+                let mut sockets = vec![
                     owned_socket(key("192.0.2.1:53000", "198.51.100.2:53001", 1), 101, false),
                     owned_socket(key("0.0.0.0:53000", "0.0.0.0:0", 2), 102, current),
                 ];
-                for socket in &mut inventory.sockets {
+                for socket in &mut sockets {
                     socket.key.protocol = protocol;
                 }
-                inventory.index.insert((protocol, 53000), vec![0, 1]);
+                let mut inventory = inventory_with(sockets);
                 let local = "192.0.2.1:53000".parse().unwrap();
                 let remote = "198.51.100.2:53001".parse().unwrap();
-                assert!(inventory.resolve(protocol, local, remote).is_none());
+                assert!(resolved_pid(inventory.resolve(protocol, local, remote)).is_none());
                 // Once the conflicting incarnation expires, attribution resumes.
-                inventory.index.insert((protocol, 53000), vec![1]);
+                inventory.sockets.remove(0);
+                inventory.rebuild_index();
                 assert_eq!(
-                    inventory
-                        .resolve(protocol, local, remote)
-                        .unwrap()
-                        .owner()
-                        .unwrap()
-                        .identity
-                        .pid,
-                    102
+                    resolved_pid(inventory.resolve(protocol, local, remote)),
+                    Some(102)
                 );
             }
         }
+    }
+
+    #[test]
+    fn closed_tcp_connection_keeps_owner_despite_open_listener() {
+        let local = "192.0.2.1:443".parse().unwrap();
+        let remote = "198.51.100.2:50000".parse().unwrap();
+        let mut listener = owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 1), 1, true);
+        listener.state = "LISTEN".to_string();
+        let retained = owned_socket(key("192.0.2.1:443", "198.51.100.2:50000", 2), 2, false);
+        let inventory = inventory_with(vec![listener.clone(), retained]);
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)),
+            Some(2)
+        );
+        // UDP has no listen state: a rebound wildcard socket can receive the
+        // same datagrams, so overlapping incarnations stay unattributed.
+        let mut sockets = vec![
+            owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 1), 1, true),
+            owned_socket(key("192.0.2.1:443", "198.51.100.2:50000", 2), 2, false),
+        ];
+        for socket in &mut sockets {
+            socket.key.protocol = Protocol::Udp;
+        }
+        let inventory = inventory_with(sockets);
+        assert!(resolved_pid(inventory.resolve(Protocol::Udp, local, remote)).is_none());
+    }
+
+    #[test]
+    fn busy_ports_use_the_exact_endpoint_index() {
+        let mut sockets = vec![owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 1), 1, true)];
+        for client in 0..10_000_u32 {
+            let remote = format!(
+                "198.51.{}.{}:{}",
+                client / 250,
+                client % 250,
+                40_000 + client % 1000
+            );
+            sockets.push(owned_socket(
+                key("192.0.2.1:443", &remote, 10 + client as u64),
+                10 + client,
+                true,
+            ));
+        }
+        let inventory = inventory_with(sockets);
+        // Only the listener needs a per-port scan; connections are looked up directly.
+        assert_eq!(inventory.by_port[&(Protocol::Tcp, 443)].len(), 1);
+        let local = "192.0.2.1:443".parse().unwrap();
+        assert_eq!(
+            resolved_pid(inventory.resolve(
+                Protocol::Tcp,
+                local,
+                "198.51.0.7:40007".parse().unwrap()
+            )),
+            Some(17)
+        );
+        // Unknown peers still fall back to the wildcard listener.
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, "203.0.113.9:1".parse().unwrap())),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn closing_remnant_does_not_hide_retained_owner() {
+        let local = "192.0.2.1:50000".parse().unwrap();
+        let remote = "198.51.100.2:443".parse().unwrap();
+        let retained = owned_socket(key("192.0.2.1:50000", "198.51.100.2:443", 7), 70, false);
+        let mut remnant = owned_socket(key("192.0.2.1:50000", "198.51.100.2:443", 0), 0, true);
+        remnant.owners.clear();
+        remnant.state = "TIME-WAIT".to_string();
+        let mut inventory = inventory_with(vec![retained.clone(), remnant.clone()]);
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)),
+            Some(70)
+        );
+        // An ownerless remnant alone stays unattributed.
+        inventory.sockets.remove(0);
+        inventory.rebuild_index();
+        assert!(resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)).is_none());
+        // A queued, not yet accepted connection is a real competing incarnation.
+        remnant.state = "ESTABLISHED".to_string();
+        let inventory = inventory_with(vec![retained, remnant]);
+        assert!(resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)).is_none());
+    }
+
+    #[test]
+    fn unscanned_new_sockets_are_pending_not_lost() {
+        let mut socket = owned_socket(key("192.0.2.1:50000", "198.51.100.2:443", 9), 0, true);
+        socket.owners.clear();
+        let mut inventory = inventory_with(vec![
+            socket.clone(),
+            owned_socket(key("0.0.0.0:50000", "0.0.0.0:0", 1), 1, true),
+        ]);
+        let local = "192.0.2.1:50000".parse().unwrap();
+        let remote = "198.51.100.2:443".parse().unwrap();
+        assert!(matches!(
+            inventory.resolve(Protocol::Tcp, local, remote),
+            Resolution::Pending
+        ));
+        // Once scanned without an owner, the socket is simply unattributed.
+        inventory.owner_keys.insert(9, socket.key);
+        assert!(matches!(
+            inventory.resolve(Protocol::Tcp, local, remote),
+            Resolution::Unattributed
+        ));
+    }
+
+    #[test]
+    fn new_sockets_trigger_a_prompt_owner_rescan() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut inventory = Inventory::new();
+        inventory.refresh();
+        let own_pid = std::process::id();
+        let owner_of = |inventory: &Inventory, listener: &std::net::TcpListener| {
+            let local = listener.local_addr().unwrap();
+            resolved_pid(inventory.resolve(Protocol::Tcp, local, "127.0.0.1:9".parse().unwrap()))
+        };
+        assert_eq!(owner_of(&inventory, &first), Some(own_pid));
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Well inside the periodic full-rescan period, but past the minimum gap.
+        inventory.last_scan = None;
+        inventory.last_owner_scan = Some(Instant::now() - Duration::from_millis(300));
+        inventory.owner_scan_cost = Duration::ZERO;
+        inventory.refresh();
+        assert_eq!(owner_of(&inventory, &second), Some(own_pid));
+    }
+
+    #[test]
+    fn exited_or_reused_pids_lose_cached_ownership() {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let alive = Owner {
+            identity: ProcessIdentity {
+                pid: std::process::id(),
+                start_time: start_time(&stat).unwrap(),
+            },
+            user: "test".to_string(),
+            name: "test".to_string(),
+        };
+        let mut reused = alive.clone();
+        reused.identity.start_time += 1;
+        let mut owners =
+            HashMap::from([(1, vec![alive.clone(), reused]), (2, vec![alive.clone()])]);
+        assert!(remove_exited_owners(&mut owners));
+        assert_eq!(owners[&1], vec![alive.clone()]);
+        assert_eq!(owners[&2], vec![alive]);
+        assert!(!remove_exited_owners(&mut owners));
+    }
+
+    #[test]
+    fn ipv6_wildcard_modes_are_cached_per_socket() {
+        let Ok(listener) = std::net::TcpListener::bind("[::]:0") else {
+            return; // No IPv6 in this environment.
+        };
+        let port = listener.local_addr().unwrap().port();
+        let mut inventory = Inventory::new();
+        inventory.refresh();
+        let key = inventory
+            .sockets
+            .iter()
+            .find(|socket| socket.current && socket.key.local.port() == port)
+            .map(|socket| socket.key.clone())
+            .unwrap();
+        let Some(&mode) = inventory.ipv6_modes.get(&key) else {
+            return; // SOCK_DIAG unavailable; unknown must stay unknown.
+        };
+        inventory.last_scan = None;
+        inventory.refresh();
+        assert_eq!(inventory.ipv6_modes.get(&key), Some(&mode));
+        assert!(inventory.ipv6_attempts.is_empty());
+        drop(listener);
+        inventory.last_scan = None;
+        inventory.refresh();
+        assert!(
+            !inventory.ipv6_modes.contains_key(&key),
+            "closed sockets leave the cache"
+        );
+    }
+
+    #[test]
+    fn socket_diagnostics_request_only_needed_states() {
+        assert_eq!(state_mask("LISTEN", Protocol::Tcp), 1 << 10);
+        assert_eq!(state_mask("CLOSE", Protocol::Tcp), 1 << 7);
+        assert_eq!(state_mask("BOUND", Protocol::Udp), 1 << 7);
+        assert_eq!(state_mask("CONNECTED", Protocol::Udp), 1 << 1);
     }
 
     #[test]

@@ -49,7 +49,7 @@ check_destination() {
 }
 
 if [[ "${1:-}" == --install ]]; then
-    (( EUID == 0 && $# == 5 )) || fail 'Internal installation requires root and four parameters.'
+    (( EUID == 0 && $# == 5 )) || fail 'Internal installation requires root, --install and four parameters.'
     # Do not inherit tool lookup or a permissive umask from the invoking user.
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     umask 077

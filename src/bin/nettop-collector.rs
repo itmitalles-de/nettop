@@ -56,7 +56,11 @@ fn serve() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = serve() {
+    // Nothing may read inherited variables with capabilities: reset them first,
+    // while still single-threaded and before libpcap or its plugins load.
+    // SAFETY: no other thread exists yet.
+    let result = unsafe { privilege::reset_environment() }.and_then(|()| serve());
+    if let Err(error) = result {
         let _ = helper::write_reply(
             &mut io::stdout().lock(),
             &Reply::Error {
