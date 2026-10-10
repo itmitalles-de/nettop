@@ -62,13 +62,16 @@ and `/proc/PID/fd` socket inodes. Identity includes PID and start time. Descript
 scans run promptly when unscanned inodes or exited cached owners appear, spaced
 by at least 200 ms or ten times the previous scan's cost, and otherwise every
 five seconds; cached owners are revalidated against `/proc/PID/stat` each second.
-Closed sockets survive briefly for late packets. Flows use an exact endpoint
+Closed sockets survive briefly for late packets; an owner whose descriptor
+closes between the socket-table read and the descriptor scan is kept for that
+scan. Flows use an exact endpoint
 index; only listeners and wildcard sockets are scanned per port.
 Ambiguous and shared ownership remains unattributed. Current sockets retain
 totals through idle periods; expired closed entries and all maps are bounded.
 Overlapping socket incarnations involving retained matches stay unattributed,
 except that a TCP listener or an inode-less closing remnant (FIN-WAIT,
-TIME-WAIT, LAST-ACK) of the same endpoint pair never competes with a connection.
+TIME-WAIT, LAST-ACK) of the same endpoint pair never competes with a connection,
+nor does the inode-less accept-queue entry of a connection accepted afterwards.
 Status flags describe the latest refresh/scan, not the process lifetime.
 Only local endpoints can match host sockets. State-filtered, per-protocol
 bounded SOCK_DIAG queries supply IPv6 wildcard V6ONLY metadata, cached per socket

@@ -23,7 +23,10 @@
   warnings, BIG TCP, SOCK_DIAG/fd-scan cost, fragments, docker-proxy DNAT and
   sysfs ifindex. TUI is English/German (`language` in Setup); the site has a
   system-aware light/dark theme and EN/DE, both with persisted toggles.
-  `tests/short_lived.py` covers sockets closed within a 20 s interval.
+  `tests/short_lived.py` covers sockets closed within a 20 s interval and a
+  slow acceptor. Its flake was fixed: an owner scan racing a descriptor close
+  dropped the known owner, and a retained accept-queue entry (inode 0) made
+  the accepted socket ambiguous for up to 3 s.
 - `cargo fmt --check`, Clippy with warnings denied, 67 Rust tests (also on Rust
   1.88.0), release build, ShellCheck, PTY terminal/setup checks, isolated live
   capture, helper and short-lived socket tests passed on 2026-10-10. CI now also
