@@ -14,9 +14,20 @@
   saved values; malformed files stay intact. The helper never reads preferences.
 - Full repository code review completed; fixed terminal signal cleanup, reused
   socket attribution, IPv4/IPv6 wildcard matching and forwarding misattribution.
-- `cargo fmt --check`, Clippy with warnings denied, 39 Rust tests, release build,
-  ShellCheck, terminal/CLI/JSON checks and Cargo Audit (109 dependencies, no known
-  vulnerabilities reported) passed on 2026-10-09.
+- Second full review (2026-10-10) fixed: CLI overrides/NO_COLOR persisted by F12,
+  runtime helper failure exiting the TUI, closed-pipe panics, unit rounding,
+  `sudo -E` settings ownership, unknown config keys, fixed white text on light
+  themes, collector environment (RDMA driver env), interval-dependent attribution
+  (background `nettop-attrib` pass every 250–500 ms), O(N²) socket resolve,
+  TIME-WAIT remnants, owner-scan latency, IPv4 alias labels, sticky drop/limit
+  warnings, BIG TCP, SOCK_DIAG/fd-scan cost, fragments, docker-proxy DNAT and
+  sysfs ifindex. TUI is English/German (`language` in Setup); the site has a
+  system-aware light/dark theme and EN/DE, both with persisted toggles.
+  `tests/short_lived.py` covers sockets closed within a 20 s interval.
+- `cargo fmt --check`, Clippy with warnings denied, 67 Rust tests (also on Rust
+  1.88.0), release build, ShellCheck, PTY terminal/setup checks, isolated live
+  capture, helper and short-lived socket tests passed on 2026-10-10. CI now also
+  runs Cargo Audit (109 dependencies, none reported locally) with job timeouts.
 - All Rust tests also passed with the declared minimum Rust 1.88.0; CI covers it.
 - `tests/setup.py` verifies real PTY editing/saving, restart, CLI overrides,
   unavailable saved interfaces and malformed settings. Terminal restoration
