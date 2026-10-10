@@ -32,7 +32,15 @@ worker keeps none after opening pcap; the sampling thread keeps only
 DAC_READ_SEARCH and SYS_PTRACE for process descriptors, as does the
 `nettop-attrib` thread it starts. All set NO_NEW_PRIVS.
 `scripts/setup-capture.sh` builds unprivileged, authenticates only for root-owned
-installation, verifies the staged digest and refuses untracked replacements.
+installation, copies the build into a root-only file (no final symlink), verifies
+that copy's digest before granting group access and capabilities, and refuses
+untracked replacements. It refuses a primary group that is not a user private
+group or has other members (`--allow-shared-group`) and a silent takeover from
+another group (`--reassign-group`). The authenticating administrator trusts the
+user's checkout. Collector status is sent both as English `message` and as
+structured `notes` (serde default, unknown codes decode as `Unknown`), which the
+UI translates; older helpers without notes keep working with English text, so
+the protocol version is unchanged.
 The UI itself never receives capabilities or elevated user IDs.
 
 `collector.rs` reads `/proc/net/dev`, sysfs interface metadata and getifaddrs.
@@ -44,8 +52,17 @@ With capture, a background `nettop-attrib` thread, started from the sampling
 thread on the first snapshot (so it inherits exactly that thread's
 capabilities), refreshes sockets and attributes captured flows every 250–500 ms,
 independent of the UI interval; snapshots only add the final pass and divide
-accumulated deltas by the interval. Flows of sockets awaiting their first owner
-scan are retried for up to one second. Wildcard-only matches to a
+accumulated deltas by the interval. Each pass drains captured flows before
+rereading socket tables, so tables are never older than the packets. Flows of
+sockets awaiting their first owner scan or V6ONLY metadata are retried until
+the next owner scan can have run (one to six seconds, derived from the
+cost-dependent scan gap, at most 4096 merged flow directions). Local flows
+without any candidate wait once for a table read after their drain; nonlocal
+flows never wait. Per pass, host addresses, loopback links and stacked-device
+relations (`master`/`upper_*` in sysfs, cached two seconds in the worker) are
+precomputed as sets. Counters carry their capture link and a lower-device flag:
+host traffic seen on a bridge port, bond slave or VLAN parent is skipped in
+all-interface rows but shown when that link is selected. Wildcard-only matches to a
 `docker-proxy` listener from non-loopback links stay unattributed, since
 AF_PACKET sees published-port traffic before Docker's DNAT.
 
@@ -72,7 +89,8 @@ Closed sockets survive briefly for late packets; an owner whose descriptor
 closes between the socket-table read and the descriptor scan is kept for that
 scan. Flows use an exact endpoint
 index; only listeners and wildcard sockets are scanned per port.
-Ambiguous and shared ownership remains unattributed. Current sockets retain
+Ambiguous and shared ownership remains unattributed, except that equally
+matching sockets of one process (`SO_REUSEPORT`) credit that process only. Current sockets retain
 totals through idle periods; expired closed entries and all maps are bounded.
 Overlapping socket incarnations involving retained matches stay unattributed,
 except that a TCP listener or an inode-less closing remnant (FIN-WAIT,
@@ -81,7 +99,11 @@ nor does the inode-less accept-queue entry of a connection accepted afterwards.
 Status flags describe the latest refresh/scan, not the process lifetime.
 Only local endpoints can match host sockets. State-filtered, per-protocol
 bounded SOCK_DIAG queries supply IPv6 wildcard V6ONLY metadata, cached per socket
-incarnation; missing metadata never implies dual-stack support.
+incarnation; missing metadata never implies dual-stack support, but an IPv4 flow
+whose only candidate is such a wildcard is deferred instead of lost. The 50 ms
+receive budget starts after sendto(), which can synchronously autoload diag
+modules; EINTR is retried. An incomplete dump is retried on the next refresh up
+to three times, a complete or rejected one that lacks a socket after two seconds.
 
 The live integration harness sends known payloads between separate processes on
 loopback. It checks each transport/address family, both process directions,

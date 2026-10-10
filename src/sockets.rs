@@ -18,8 +18,15 @@ const MIN_REFRESH: Duration = Duration::from_millis(200);
 const MIN_OWNER_SCAN_GAP: Duration = Duration::from_millis(200);
 const FULL_OWNER_RESCAN: Duration = Duration::from_secs(5);
 const OWNER_CHECK: Duration = Duration::from_secs(1);
+/// Budget for receiving one SOCK_DIAG dump, counted from after the request
+/// was sent: the first query can autoload inet_diag/udp_diag synchronously
+/// inside sendto().
 const DIAG_DEADLINE: Duration = Duration::from_millis(50);
+/// Pause after a complete or rejected dump that lacked a socket.
 const DIAG_RETRY: Duration = Duration::from_secs(2);
+/// Incomplete dumps (deadline, interruption) are retried on the next refresh
+/// this many times in a row before backing off like failed lookups.
+const DIAG_PROMPT_RETRIES: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ProcessIdentity {
@@ -69,10 +76,54 @@ impl Socket {
 pub(super) enum Resolution<'a> {
     /// Exactly one best socket with a single owning process.
     Owned(&'a Socket),
-    /// The best socket is new and its owner has not been scanned yet.
+    /// Several equally good sockets (SO_REUSEPORT) of one process; the
+    /// socket is a representative only, the process is certain.
+    Process(&'a Socket),
+    /// The best socket is new and its owner has not been scanned yet, or the
+    /// only candidate is an IPv6 wildcard whose V6ONLY mode is still unknown.
     Pending,
-    /// No, an ambiguous, or a shared/ownerless match.
+    /// No listed socket matches this endpoint.
+    Missing,
+    /// An ambiguous, or a shared/ownerless match.
     Unattributed,
+}
+
+/// The latest SOCK_DIAG lookup for one IPv6 wildcard socket that lacked it.
+#[derive(Clone, Copy, Debug)]
+struct DiagAttempt {
+    at: Instant,
+    /// Incomplete dumps in a row; a complete answer sets the full backoff.
+    incomplete: u8,
+}
+
+impl DiagAttempt {
+    fn due(&self, now: Instant) -> bool {
+        self.incomplete < DIAG_PROMPT_RETRIES
+            || now.saturating_duration_since(self.at) >= DIAG_RETRY
+    }
+
+    fn next(previous: Option<&Self>, outcome: DiagOutcome, now: Instant) -> Self {
+        Self {
+            at: now,
+            incomplete: match outcome {
+                DiagOutcome::Incomplete => {
+                    previous.map_or(0, |attempt| attempt.incomplete.min(DIAG_PROMPT_RETRIES)) + 1
+                }
+                DiagOutcome::Complete | DiagOutcome::Rejected => DIAG_PROMPT_RETRIES,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagOutcome {
+    /// The dump ended (NLMSG_DONE); an open socket missing from it stays
+    /// unknown, retried after DIAG_RETRY.
+    Complete,
+    /// The kernel rejected the query, e.g. without udp_diag support.
+    Rejected,
+    /// Deadline, interruption or a malformed reply: retry promptly.
+    Incomplete,
 }
 
 type ExactKey = (Protocol, SocketAddr, SocketAddr);
@@ -100,7 +151,7 @@ pub(super) struct Inventory {
     carried_owners: HashSet<u64>,
     owner_scan_cost: Duration,
     ipv6_modes: HashMap<SocketKey, bool>,
-    ipv6_attempts: HashMap<SocketKey, Instant>,
+    ipv6_attempts: HashMap<SocketKey, DiagAttempt>,
     last_scan: Option<Instant>,
     last_owner_scan: Option<Instant>,
     last_owner_check: Option<Instant>,
@@ -229,7 +280,7 @@ impl Inventory {
         let unscanned = current.iter().any(|socket| {
             socket.key.inode != 0 && self.owner_keys.get(&socket.key.inode) != Some(&socket.key)
         });
-        let gap = (self.owner_scan_cost * 10).clamp(MIN_OWNER_SCAN_GAP, FULL_OWNER_RESCAN);
+        let gap = self.owner_scan_gap();
         let due = self.last_owner_scan.is_none_or(|last| {
             let since = now.saturating_duration_since(last);
             since >= FULL_OWNER_RESCAN || ((unscanned || self.owners_stale) && since >= gap)
@@ -264,9 +315,26 @@ impl Inventory {
         self.last_owner_check = Some(now);
     }
 
+    /// Minimum spacing of prompt owner scans: ten times the previous scan's
+    /// cost, so scans use at most about a tenth of one CPU.
+    pub(super) fn owner_scan_gap(&self) -> Duration {
+        (self.owner_scan_cost * 10).clamp(MIN_OWNER_SCAN_GAP, FULL_OWNER_RESCAN)
+    }
+
+    /// When the socket tables were last reread, if ever.
+    pub(super) fn refreshed_at(&self) -> Option<Instant> {
+        self.last_scan
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_refreshed_at(&mut self, at: Option<Instant>) {
+        self.last_scan = at;
+    }
+
     /// IPV6_V6ONLY cannot change after bind, so results are cached per socket
-    /// incarnation and only new wildcard sockets are queried. Failed lookups
-    /// are retried after a pause instead of on every refresh.
+    /// incarnation and only new wildcard sockets are queried. Sockets missing
+    /// from a complete answer are retried after a pause instead of on every
+    /// refresh; an incomplete dump is retried promptly a few times.
     fn refresh_ipv6_modes(&mut self, current: &[Socket], now: Instant) {
         let wanted: HashMap<&SocketKey, u32> = current
             .iter()
@@ -284,7 +352,7 @@ impl Inventory {
                     && self
                         .ipv6_attempts
                         .get(key)
-                        .is_none_or(|last| now.saturating_duration_since(*last) >= DIAG_RETRY)
+                        .is_none_or(|attempt| attempt.due(now))
                 {
                     missing.insert(key.clone());
                     states |= mask;
@@ -294,16 +362,19 @@ impl Inventory {
                 continue;
             }
             // Each protocol has its own deadline; a slow TCP dump cannot starve UDP.
-            read_ipv6_modes(
+            let outcome = read_ipv6_modes(
                 protocol,
                 states,
                 &missing,
                 &mut self.ipv6_modes,
-                Instant::now() + DIAG_DEADLINE,
+                DIAG_DEADLINE,
             );
             for key in missing {
-                if !self.ipv6_modes.contains_key(&key) {
-                    self.ipv6_attempts.insert(key, now);
+                if self.ipv6_modes.contains_key(&key) {
+                    self.ipv6_attempts.remove(&key);
+                } else {
+                    let attempt = DiagAttempt::next(self.ipv6_attempts.get(&key), outcome, now);
+                    self.ipv6_attempts.insert(key, attempt);
                 }
             }
         }
@@ -362,9 +433,10 @@ impl Inventory {
             .max();
         let mut best = None;
         let mut best_score = 0;
-        let mut ambiguous = false;
+        let mut tied: Vec<&Socket> = Vec::new();
         let mut matching_incarnations = 0;
         let mut retained_match = false;
+        let mut unknown_mode = false;
         let candidates = exact
             .iter()
             .map(|&index| (index, true))
@@ -385,6 +457,7 @@ impl Inventory {
                 continue;
             }
             let Some(score) = match_score(socket, local, remote) else {
+                unknown_mode |= socket.current && unknown_ipv6_mode(socket, local, remote);
                 continue;
             };
             exact_match |= is_exact;
@@ -393,23 +466,53 @@ impl Inventory {
             if score > best_score {
                 best = Some(socket);
                 best_score = score;
-                ambiguous = false;
+                tied.clear();
             } else if score == best_score
                 && best.is_some_and(|other: &Socket| other.key != socket.key)
             {
-                ambiguous = true;
+                tied.push(socket);
             }
         }
         // A batch can straddle a close/rebind. Prefer neither incarnation when
         // both match, even after both have closed: a retained connected socket
         // must not steal a later wildcard socket's packets, or vice versa.
-        if ambiguous || (retained_match && matching_incarnations > 1) {
+        if retained_match && matching_incarnations > 1 {
             return Resolution::Unattributed;
         }
-        match best {
-            Some(socket) if socket.owner().is_some() => Resolution::Owned(socket),
-            Some(socket) if self.awaiting_owner(socket) => Resolution::Pending,
-            _ => Resolution::Unattributed,
+        let Some(best) = best else {
+            // An IPv4 packet and a dual-stack-capable IPv6 wildcard whose
+            // V6ONLY lookup is still outstanding: wait instead of losing it.
+            return if unknown_mode {
+                Resolution::Pending
+            } else {
+                Resolution::Missing
+            };
+        };
+        if !tied.is_empty() {
+            // SO_REUSEPORT groups and similar ties: credit the process when
+            // every tied socket belongs to the same single owner.
+            let identity = best.owner().map(|owner| owner.identity);
+            let pending = std::iter::once(best)
+                .chain(tied.iter().copied())
+                .any(|socket| self.awaiting_owner(socket));
+            return if pending {
+                Resolution::Pending
+            } else if identity.is_some()
+                && tied
+                    .iter()
+                    .all(|socket| socket.owner().map(|owner| owner.identity) == identity)
+            {
+                Resolution::Process(best)
+            } else {
+                Resolution::Unattributed
+            };
+        }
+        if best.owner().is_some() {
+            Resolution::Owned(best)
+        } else if self.awaiting_owner(best) {
+            Resolution::Pending
+        } else {
+            Resolution::Unattributed
         }
     }
 
@@ -518,44 +621,62 @@ fn state_mask(label: &str, protocol: Protocol) -> u32 {
 }
 
 fn match_score(socket: &Socket, local: SocketAddr, remote: SocketAddr) -> Option<u8> {
-    if socket.key.local.port() != local.port() {
+    endpoint_score(&socket.key, socket.ipv6_only, local, remote)
+}
+
+fn endpoint_score(
+    key: &SocketKey,
+    ipv6_only: Option<bool>,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> Option<u8> {
+    if key.local.port() != local.port() {
         return None;
     }
-    let local_ip = canonical_ip(socket.key.local.ip());
+    let local_ip = canonical_ip(key.local.ip());
     let packet_local = canonical_ip(local.ip());
     let local_score = if local_ip == packet_local {
         2
     } else if local_ip.is_unspecified()
         && (local_ip.is_ipv4() == packet_local.is_ipv4()
-            || (local_ip.is_ipv6() && socket.ipv6_only == Some(false)))
+            || (local_ip.is_ipv6() && ipv6_only == Some(false)))
     {
         1
     } else {
         return None;
     };
-    let remote_ip = canonical_ip(socket.key.remote.ip());
+    let remote_ip = canonical_ip(key.remote.ip());
     let packet_remote = canonical_ip(remote.ip());
-    if remote_ip.is_unspecified() && socket.key.remote.port() == 0 {
+    if remote_ip.is_unspecified() && key.remote.port() == 0 {
         Some(local_score)
-    } else if remote_ip == packet_remote && socket.key.remote.port() == remote.port() {
+    } else if remote_ip == packet_remote && key.remote.port() == remote.port() {
         Some(local_score + 4)
     } else {
         None
     }
 }
 
+/// An IPv4 packet that an IPv6 wildcard socket would own if it is dual
+/// stack, while its V6ONLY mode is not known yet.
+fn unknown_ipv6_mode(socket: &Socket, local: SocketAddr, remote: SocketAddr) -> bool {
+    socket.ipv6_only.is_none()
+        && socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        && canonical_ip(local.ip()).is_ipv4()
+        && endpoint_score(&socket.key, Some(false), local, remote).is_some()
+}
+
 /// SOCK_DIAG exposes IPV6_V6ONLY without opening another process's descriptor.
 /// Only wildcard IPv6 sockets need it; a denied/unsupported query leaves IPv4
 /// attribution unknown. The kernel filters by state (listeners for TCP,
 /// unconnected sockets for UDP), and both elapsed time and retained response
-/// data are bounded.
+/// data are bounded. `budget` starts once the request is sent.
 fn read_ipv6_modes(
     protocol: Protocol,
     states: u32,
     wanted: &HashSet<SocketKey>,
     modes: &mut HashMap<SocketKey, bool>,
-    deadline: Instant,
-) {
+    budget: Duration,
+) -> DiagOutcome {
     // The request/response layouts are Linux UAPI inet_diag_req_v2 and
     // inet_diag_msg. Integer headers are native endian; addresses/ports are not.
     let raw = unsafe {
@@ -566,7 +687,7 @@ fn read_ipv6_modes(
         )
     };
     if raw < 0 {
-        return;
+        return DiagOutcome::Rejected;
     }
     let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut request = [0_u8; 72];
@@ -580,19 +701,27 @@ fn read_ipv6_modes(
     request[64..72].fill(0xff); // INET_DIAG_NOCOOKIE
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    let sent = unsafe {
-        libc::sendto(
-            descriptor.as_raw_fd(),
-            request.as_ptr().cast(),
-            request.len(),
-            0,
-            (&kernel as *const libc::sockaddr_nl).cast(),
-            std::mem::size_of_val(&kernel) as libc::socklen_t,
-        )
+    let sent = loop {
+        let sent = unsafe {
+            libc::sendto(
+                descriptor.as_raw_fd(),
+                request.as_ptr().cast(),
+                request.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of_val(&kernel) as libc::socklen_t,
+            )
+        };
+        if sent >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break sent;
+        }
     };
     if sent != request.len() as isize {
-        return;
+        return DiagOutcome::Rejected;
     }
+    // The first query can autoload diag modules synchronously inside
+    // sendto(), so the receive deadline only starts now.
+    let deadline = Instant::now() + budget;
     let mut buffer = [0_u8; 65_536];
     while Instant::now() < deadline {
         let mut ready = libc::pollfd {
@@ -604,8 +733,15 @@ fn read_ipv6_modes(
             .saturating_duration_since(Instant::now())
             .as_millis()
             .max(1) as i32;
-        if unsafe { libc::poll(&mut ready, 1, timeout) } <= 0 {
-            return;
+        match unsafe { libc::poll(&mut ready, 1, timeout) } {
+            0 => return DiagOutcome::Incomplete,
+            ready if ready < 0 => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return DiagOutcome::Incomplete;
+            }
+            _ => {}
         }
         let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         let mut sender_len = std::mem::size_of_val(&sender) as libc::socklen_t;
@@ -619,30 +755,62 @@ fn read_ipv6_modes(
                 &mut sender_len,
             )
         };
-        if length <= 0 || length as usize > buffer.len() || sender.nl_pid != 0 {
-            return;
+        if length < 0 {
+            let error = std::io::Error::last_os_error().kind();
+            if matches!(
+                error,
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return DiagOutcome::Incomplete;
         }
-        let mut messages = &buffer[..length as usize];
-        while messages.len() >= 16 {
-            let length = u32::from_ne_bytes(messages[..4].try_into().unwrap()) as usize;
-            if length < 16 || length > messages.len() {
-                return;
-            }
-            let kind = u16::from_ne_bytes(messages[4..6].try_into().unwrap());
-            let sequence = u32::from_ne_bytes(messages[8..12].try_into().unwrap());
-            if sequence != 1 || matches!(kind, 2 | 3) {
-                return; // NLMSG_ERROR / NLMSG_DONE
-            }
-            if kind == 20
-                && let Some((key, only)) = parse_ipv6_mode(&messages[16..length], protocol)
-                && wanted.contains(&key)
-            {
-                modes.insert(key, only);
-            }
-            let aligned = (length + 3) & !3;
-            messages = messages.get(aligned..).unwrap_or_default();
+        if length == 0 || length as usize > buffer.len() || sender.nl_pid != 0 {
+            return DiagOutcome::Incomplete;
+        }
+        if let Some(outcome) =
+            parse_diag_datagram(&buffer[..length as usize], protocol, wanted, modes)
+        {
+            return outcome;
         }
     }
+    DiagOutcome::Incomplete
+}
+
+/// Records the wanted sockets of one netlink datagram. `None` means the dump
+/// continues in a later datagram.
+fn parse_diag_datagram(
+    mut messages: &[u8],
+    protocol: Protocol,
+    wanted: &HashSet<SocketKey>,
+    modes: &mut HashMap<SocketKey, bool>,
+) -> Option<DiagOutcome> {
+    while messages.len() >= 16 {
+        let length = u32::from_ne_bytes(messages[..4].try_into().unwrap()) as usize;
+        if length < 16 || length > messages.len() {
+            return Some(DiagOutcome::Incomplete);
+        }
+        let kind = u16::from_ne_bytes(messages[4..6].try_into().unwrap());
+        let sequence = u32::from_ne_bytes(messages[8..12].try_into().unwrap());
+        if sequence != 1 {
+            return Some(DiagOutcome::Incomplete);
+        }
+        match kind {
+            2 => return Some(DiagOutcome::Rejected), // NLMSG_ERROR
+            3 => return Some(DiagOutcome::Complete), // NLMSG_DONE
+            20 => {
+                if let Some((key, only)) = parse_ipv6_mode(&messages[16..length], protocol)
+                    && wanted.contains(&key)
+                {
+                    modes.insert(key, only);
+                }
+            }
+            _ => {}
+        }
+        let aligned = (length + 3) & !3;
+        messages = messages.get(aligned..).unwrap_or_default();
+    }
+    None
 }
 
 fn parse_ipv6_mode(message: &[u8], protocol: Protocol) -> Option<(SocketKey, bool)> {
@@ -953,7 +1121,10 @@ mod tests {
     fn resolved_pid(resolution: Resolution<'_>) -> Option<u32> {
         match resolution {
             Resolution::Owned(socket) => Some(socket.owner().unwrap().identity.pid),
-            Resolution::Pending | Resolution::Unattributed => None,
+            Resolution::Process(_)
+            | Resolution::Pending
+            | Resolution::Missing
+            | Resolution::Unattributed => None,
         }
     }
 
@@ -1243,6 +1414,205 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn ipv4_to_an_ipv6_wildcard_of_unknown_mode_waits() {
+        let mut socket = owned_socket(key("[::]:53000", "[::]:0", 1), 101, true);
+        socket.key.protocol = Protocol::Udp;
+        let mut inventory = inventory_with(vec![socket]);
+        let local = "127.0.0.1:53000".parse().unwrap();
+        let remote = "127.0.0.1:53001".parse().unwrap();
+        assert!(matches!(
+            inventory.resolve(Protocol::Udp, local, remote),
+            Resolution::Pending
+        ));
+        inventory.sockets[0].ipv6_only = Some(false);
+        assert_eq!(
+            resolved_pid(inventory.resolve(Protocol::Udp, local, remote)),
+            Some(101)
+        );
+        // An IPv6-only wildcard can never own it.
+        inventory.sockets[0].ipv6_only = Some(true);
+        assert!(matches!(
+            inventory.resolve(Protocol::Udp, local, remote),
+            Resolution::Missing
+        ));
+        // IPv6 packets and closed sockets never wait for the mode.
+        inventory.sockets[0].ipv6_only = None;
+        assert_eq!(
+            resolved_pid(inventory.resolve(
+                Protocol::Udp,
+                "[::1]:53000".parse().unwrap(),
+                "[::1]:53001".parse().unwrap()
+            )),
+            Some(101)
+        );
+        inventory.sockets[0].current = false;
+        assert!(matches!(
+            inventory.resolve(Protocol::Udp, local, remote),
+            Resolution::Missing
+        ));
+    }
+
+    #[test]
+    fn endpoints_without_any_socket_are_missing() {
+        let inventory = inventory_with(vec![owned_socket(
+            key("127.0.0.1:8080", "0.0.0.0:0", 1),
+            1,
+            true,
+        )]);
+        assert!(matches!(
+            inventory.resolve(
+                Protocol::Tcp,
+                "127.0.0.1:9090".parse().unwrap(),
+                "127.0.0.1:50000".parse().unwrap()
+            ),
+            Resolution::Missing
+        ));
+    }
+
+    #[test]
+    fn reuseport_sockets_of_one_process_credit_that_process() {
+        let local = "192.0.2.1:443".parse().unwrap();
+        let remote = "198.51.100.2:23456".parse().unwrap();
+        let mut sockets: Vec<_> = [1, 2]
+            .map(|inode| owned_socket(key("0.0.0.0:443", "0.0.0.0:0", inode), 7, true))
+            .into();
+        let inventory = inventory_with(sockets.clone());
+        match inventory.resolve(Protocol::Tcp, local, remote) {
+            Resolution::Process(socket) => assert_eq!(socket.owner().unwrap().identity.pid, 7),
+            _ => panic!("tied sockets of one process credit the process"),
+        }
+        // A socket still awaiting its owner scan may belong to someone else.
+        sockets[1].owners.clear();
+        let inventory = inventory_with(sockets.clone());
+        assert!(matches!(
+            inventory.resolve(Protocol::Tcp, local, remote),
+            Resolution::Pending
+        ));
+        // Different processes, or a reused PID, stay unattributed.
+        sockets[1] = owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 2), 8, true);
+        let inventory = inventory_with(sockets.clone());
+        assert!(matches!(
+            inventory.resolve(Protocol::Tcp, local, remote),
+            Resolution::Unattributed
+        ));
+        sockets[1] = owned_socket(key("0.0.0.0:443", "0.0.0.0:0", 2), 7, true);
+        sockets[1].owners[0].identity.start_time += 1;
+        let inventory = inventory_with(sockets);
+        assert!(matches!(
+            inventory.resolve(Protocol::Tcp, local, remote),
+            Resolution::Unattributed
+        ));
+    }
+
+    #[test]
+    fn incomplete_diag_dumps_retry_promptly_then_back_off() {
+        let start = Instant::now();
+        let mut attempt = None;
+        for _ in 0..DIAG_PROMPT_RETRIES - 1 {
+            let next = DiagAttempt::next(attempt.as_ref(), DiagOutcome::Incomplete, start);
+            assert!(next.due(start), "a timed-out dump is retried next refresh");
+            attempt = Some(next);
+        }
+        let exhausted = DiagAttempt::next(attempt.as_ref(), DiagOutcome::Incomplete, start);
+        assert!(!exhausted.due(start + Duration::from_millis(250)));
+        assert!(exhausted.due(start + DIAG_RETRY));
+        for outcome in [DiagOutcome::Complete, DiagOutcome::Rejected] {
+            let answered = DiagAttempt::next(None, outcome, start);
+            assert!(!answered.due(start + Duration::from_millis(250)));
+            assert!(answered.due(start + DIAG_RETRY));
+        }
+    }
+
+    fn netlink_message(kind: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let length = 16 + payload.len();
+        let mut message = Vec::new();
+        message.extend_from_slice(&(length as u32).to_ne_bytes());
+        message.extend_from_slice(&kind.to_ne_bytes());
+        message.extend_from_slice(&0_u16.to_ne_bytes());
+        message.extend_from_slice(&sequence.to_ne_bytes());
+        message.extend_from_slice(&0_u32.to_ne_bytes());
+        message.extend_from_slice(payload);
+        message.resize((length + 3) & !3, 0);
+        message
+    }
+
+    #[test]
+    fn diag_dumps_distinguish_complete_rejected_and_partial_replies() {
+        let mut socket = vec![0; 80];
+        socket[0] = libc::AF_INET6 as u8;
+        socket[4..6].copy_from_slice(&53000_u16.to_be_bytes());
+        socket[68..72].copy_from_slice(&123_u32.to_ne_bytes());
+        socket[72..74].copy_from_slice(&5_u16.to_ne_bytes());
+        socket[74..76].copy_from_slice(&11_u16.to_ne_bytes());
+        let wanted = HashSet::from([SocketKey {
+            inode: 123,
+            protocol: Protocol::Udp,
+            local: "[::]:53000".parse().unwrap(),
+            remote: "[::]:0".parse().unwrap(),
+        }]);
+        let mut modes = HashMap::new();
+        let partial = netlink_message(20, 1, &socket);
+        assert_eq!(
+            parse_diag_datagram(&partial, Protocol::Udp, &wanted, &mut modes),
+            None,
+            "the dump continues in the next datagram"
+        );
+        assert_eq!(modes.values().copied().collect::<Vec<_>>(), vec![false]);
+        let mut done = partial.clone();
+        done.extend(netlink_message(3, 1, &[0; 4]));
+        assert_eq!(
+            parse_diag_datagram(&done, Protocol::Udp, &wanted, &mut modes),
+            Some(DiagOutcome::Complete)
+        );
+        assert_eq!(
+            parse_diag_datagram(
+                &netlink_message(2, 1, &[0; 20]),
+                Protocol::Udp,
+                &wanted,
+                &mut modes
+            ),
+            Some(DiagOutcome::Rejected)
+        );
+        for broken in [netlink_message(20, 2, &socket), partial[..20].to_vec()] {
+            assert_eq!(
+                parse_diag_datagram(&broken, Protocol::Udp, &wanted, &mut modes),
+                Some(DiagOutcome::Incomplete)
+            );
+        }
+    }
+
+    #[test]
+    fn live_diag_query_finishes_within_its_budget() {
+        let Ok(socket) = std::net::UdpSocket::bind("[::]:0") else {
+            return; // No IPv6 in this environment.
+        };
+        let port = socket.local_addr().unwrap().port();
+        let mut inventory = Inventory::new();
+        inventory.refresh();
+        let Some(key) = inventory
+            .sockets
+            .iter()
+            .find(|socket| socket.current && socket.key.local.port() == port)
+            .map(|socket| socket.key.clone())
+        else {
+            return;
+        };
+        let mut modes = HashMap::new();
+        let outcome = read_ipv6_modes(
+            Protocol::Udp,
+            1 << 7,
+            &HashSet::from([key.clone()]),
+            &mut modes,
+            Duration::from_secs(2),
+        );
+        // Some sandboxes deny SOCK_DIAG; a granted query must complete.
+        assert_ne!(outcome, DiagOutcome::Incomplete);
+        if outcome == DiagOutcome::Complete {
+            assert!(modes.contains_key(&key));
+        }
     }
 
     #[test]

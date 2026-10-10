@@ -2,6 +2,7 @@
 //! output intentionally stay English and stable.
 
 use crate::config::Language;
+use crate::model::{CaptureNote, CaptureStatus};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Lang {
@@ -91,6 +92,130 @@ impl Lang {
         )
     }
 
+    pub fn settings_path_unavailable(self) -> &'static str {
+        self.pick(
+            "settings path unavailable",
+            "Einstellungspfad nicht verfügbar",
+        )
+    }
+
+    /// Collector status text. English is also the stable `message` field.
+    /// Details from libpcap or the system stay as reported.
+    pub fn capture_note(self, note: &CaptureNote) -> String {
+        let de = self == Self::De;
+        match note {
+            CaptureNote::Disabled => self
+                .pick(
+                    "Capture disabled (--no-capture); interface counters and sockets only",
+                    "Mitschnitt aus (--no-capture); nur Schnittstellenzähler und Sockets",
+                )
+                .into(),
+            CaptureNote::LibpcapMissing => self
+                .pick(
+                    "Install libpcap runtime (libpcap0.8); process rates unavailable",
+                    "libpcap-Laufzeit (libpcap0.8) installieren; Prozessraten nicht verfügbar",
+                )
+                .into(),
+            CaptureNote::SetupNeeded { detail } if de => format!(
+                "Prozess-Mitschnitt braucht einmalige Einrichtung (siehe README); nicht verfügbar: {detail}"
+            ),
+            CaptureNote::SetupNeeded { detail } => format!(
+                "Process capture needs one-time setup (see README); capture unavailable: {detail}"
+            ),
+            CaptureNote::Unavailable { detail } if de => {
+                format!("Prozess-Mitschnitt nicht verfügbar: {detail}")
+            }
+            CaptureNote::Unavailable { detail } => format!("Process capture unavailable: {detail}"),
+            CaptureNote::NoInterfaceIndexes => self
+                .pick(
+                    "Process rates unavailable: libpcap lacks SLL2 interface indexes; upgrade libpcap or use -i all",
+                    "Prozessraten nicht verfügbar: libpcap fehlen SLL2-Schnittstellenindizes; libpcap aktualisieren oder -i all nutzen",
+                )
+                .into(),
+            CaptureNote::AllInterfaces => self
+                .pick(
+                    "ALL interfaces: forwarded bridge/veth packets can repeat; process rates count captured IP bytes",
+                    "ALLE Schnittstellen: weitergeleitete Bridge/veth-Pakete können sich wiederholen; Prozessraten zählen mitgeschnittene IP-Bytes",
+                )
+                .into(),
+            CaptureNote::Sampled => self
+                .pick(
+                    "Process rates: captured IP bytes; socket/PID owners sampled, brief sockets may be unattributed",
+                    "Prozessraten: mitgeschnittene IP-Bytes; Socket/PID-Besitzer abgetastet, kurze Sockets evtl. unzugeordnet",
+                )
+                .into(),
+            CaptureNote::PcapMissed { packets } if de => {
+                format!("pcap hat {packets} Pakete verpasst")
+            }
+            CaptureNote::PcapMissed { packets } => format!("pcap missed {packets} packets"),
+            CaptureNote::FlowLimit { packets } if de => {
+                format!("Flusslimit: {packets} Pakete unzugeordnet")
+            }
+            CaptureNote::FlowLimit { packets } => {
+                format!("flow limit: {packets} packets unattributed")
+            }
+            CaptureNote::Unreadable {
+                unsupported,
+                truncated,
+            } if de => format!(
+                "kein IP/nicht unterstützt {unsupported} / unlesbare Header {truncated}"
+            ),
+            CaptureNote::Unreadable {
+                unsupported,
+                truncated,
+            } => format!("non-IP/unsupported {unsupported} / unreadable headers {truncated}"),
+            CaptureNote::AttributionAtRefresh { error } if de => {
+                format!("Zuordnung nur beim Aktualisieren: {error}")
+            }
+            CaptureNote::AttributionAtRefresh { error } => {
+                format!("attribution only at refresh: {error}")
+            }
+            CaptureNote::Stopped { error } if de => format!(
+                "Prozess-Mitschnitt gestoppt: {error}; Schnittstellenzähler bleiben verfügbar"
+            ),
+            CaptureNote::Stopped { error } => format!(
+                "Process capture stopped: {error}; interface counters remain available"
+            ),
+            CaptureNote::OwnersInaccessible => self
+                .pick(
+                    "some /proc owners inaccessible",
+                    "einige /proc-Besitzer unzugänglich",
+                )
+                .into(),
+            CaptureNote::CounterLimit => self
+                .pick(
+                    "socket/owner counter limit reached",
+                    "Socket/Besitzer-Zählerlimit erreicht",
+                )
+                .into(),
+            CaptureNote::InterfaceMissing { name } if de => {
+                format!("F2: Schnittstelle wählen; {name} ist nicht verfügbar")
+            }
+            CaptureNote::InterfaceMissing { name } => {
+                format!("F2: choose interface; {name} is unavailable")
+            }
+            CaptureNote::Unknown => String::new(),
+        }
+    }
+
+    /// The translated status, or `None` when it must be shown as sent: by a
+    /// helper without structured notes, or with a note this UI does not know.
+    /// `routine` includes the always-true explanation shown in F1 Help.
+    pub fn capture_status(self, status: &CaptureStatus, routine: bool) -> Option<String> {
+        if status.notes.is_empty() || status.notes.contains(&CaptureNote::Unknown) {
+            return None;
+        }
+        Some(
+            status
+                .notes
+                .iter()
+                .filter(|note| routine || **note != CaptureNote::Sampled)
+                .map(|note| self.capture_note(note))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
     pub fn helper_failed(self, error: &str) -> String {
         match self {
             Self::En => format!("Capture helper failed: {error}; using direct counters"),
@@ -122,5 +247,43 @@ mod tests {
         assert_eq!(Lang::resolve(Language::Auto, Lang::De), Lang::De);
         assert_eq!(Lang::resolve(Language::En, Lang::De), Lang::En);
         assert_eq!(Lang::resolve(Language::De, Lang::En), Lang::De);
+    }
+
+    #[test]
+    fn capture_status_is_translated_or_shown_as_sent() {
+        let mut status = CaptureStatus {
+            active: true,
+            message: "raw helper text".into(),
+            dropped: 0,
+            notes: vec![
+                CaptureNote::Sampled,
+                CaptureNote::OwnersInaccessible,
+                CaptureNote::InterfaceMissing {
+                    name: "eth9".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            Lang::De.capture_status(&status, false).unwrap(),
+            "einige /proc-Besitzer unzugänglich; F2: Schnittstelle wählen; eth9 ist nicht verfügbar"
+        );
+        let english = Lang::En.capture_status(&status, true).unwrap();
+        assert!(english.starts_with("Process rates: captured IP bytes;"));
+        assert!(english.ends_with(
+            "; some /proc owners inaccessible; F2: choose interface; eth9 is unavailable"
+        ));
+        // Unknown codes from a newer helper decode, and the raw text is shown.
+        let decoded: CaptureStatus = serde_json::from_str(
+            r#"{"active":true,"message":"m","dropped":0,"notes":[{"code":"from_the_future","x":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.notes, vec![CaptureNote::Unknown]);
+        assert!(Lang::De.capture_status(&decoded, true).is_none());
+        // Helpers predating structured notes send only the message.
+        let old: CaptureStatus =
+            serde_json::from_str(r#"{"active":false,"message":"m","dropped":0}"#).unwrap();
+        assert!(old.notes.is_empty());
+        status.notes.clear();
+        assert!(Lang::De.capture_status(&status, true).is_none());
     }
 }
