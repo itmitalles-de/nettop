@@ -1,13 +1,15 @@
 //! Linux per-thread capability handling for the optional capture helper.
 //!
-//! The UI has no file capabilities. The helper receives only NET_RAW,
-//! DAC_READ_SEARCH and SYS_PTRACE. After opening pcap, its worker drops all
-//! capabilities; the sampling thread keeps only the two /proc read capabilities.
+//! The UI has no file capabilities. Standard helpers receive NET_RAW,
+//! DAC_READ_SEARCH and SYS_PTRACE; extended helpers add BPF, PERFMON and
+//! NET_ADMIN. Capture and BPF workers drop all capabilities after setup, the
+//! conntrack worker keeps NET_ADMIN, and sampling keeps only /proc read access.
 
 use anyhow::{Context, Result, bail};
 
 const CAP_DAC_READ_SEARCH: u32 = 2;
 const CAP_NET_RAW: u32 = 13;
+const CAP_NET_ADMIN: u32 = 12;
 const CAP_SYS_PTRACE: u32 = 19;
 const READ_CAPS: u64 = (1 << CAP_DAC_READ_SEARCH) | (1 << CAP_SYS_PTRACE);
 const REQUIRED_CAPS: u64 = READ_CAPS | (1 << CAP_NET_RAW);
@@ -103,6 +105,11 @@ pub fn drop_capture_privileges() -> Result<()> {
 /// Called by the helper's sampling thread after the capture worker is ready.
 pub fn retain_process_read_privileges() -> Result<()> {
     retain(READ_CAPS)
+}
+
+/// The fixed read-only conntrack worker alone needs NET_ADMIN for queries.
+pub fn retain_conntrack_privileges() -> Result<()> {
+    retain(1 << CAP_NET_ADMIN)
 }
 
 #[cfg(test)]

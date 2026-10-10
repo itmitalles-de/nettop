@@ -38,6 +38,7 @@ RECEIPT = HELPER.with_name(".nettop-collector.sha256")
 READ_CAPS = (1 << 2) | (1 << 19)
 HELPER_CAPS = READ_CAPS | (1 << 13)
 FILE_CAPS = "cap_dac_read_search,cap_net_raw,cap_sys_ptrace=ep"
+EXTENDED_FILE_CAPS = "cap_dac_read_search,cap_net_raw,cap_sys_ptrace,cap_net_admin,cap_bpf,cap_perfmon=ep"
 
 
 def status(pid, tid=None):
@@ -410,15 +411,17 @@ def check_abrupt_exit(binary, account):
 def check_installer(script, build, account):
     digest = hashlib.sha256(build.read_bytes()).hexdigest()
 
-    def install(success, target=account, shared="1", reassign="0", expect=""):
+    def install(success, target=account, shared="1", reassign="0", expect="", extended="0"):
         # nobody's primary group nogroup is not a user private group.
         command = ["bash", str(script), "--install", str(build), str(target.pw_uid),
-                   str(target.pw_gid), digest, shared, reassign]
+                   str(target.pw_gid), digest, shared, reassign, extended]
         result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
         output = result.stdout + result.stderr
         assert (result.returncode == 0) == success, f"Unexpected installer result: {output}"
         assert expect in output, f"Installer did not explain {expect!r}: {output}"
 
+    for option in ("yes", "01", "-1", "1;true"):
+        install(False, extended=option, expect="Invalid installation options")
     install(False, shared="0", expect="not the private group")
     assert not os.path.lexists(HELPER), "A refused shared group still installed the helper"
     install(True)
@@ -427,7 +430,12 @@ def check_installer(script, build, account):
     assert installed.st_mode & 0o7777 == 0o750
     assert RECEIPT.read_text().strip() == digest
     subprocess.run(["setcap", "-v", FILE_CAPS, str(HELPER)], check=True, stdout=subprocess.DEVNULL)
+    # Validate the opt-in install grant and its removal without executing an
+    # extended helper: default containers need no additional bounding-set caps.
+    install(True, extended="1")
+    subprocess.run(["setcap", "-v", EXTENDED_FILE_CAPS, str(HELPER)], check=True, stdout=subprocess.DEVNULL)
     install(True)
+    subprocess.run(["setcap", "-v", FILE_CAPS, str(HELPER)], check=True, stdout=subprocess.DEVNULL)
     assert hashlib.sha256(HELPER.read_bytes()).hexdigest() == digest, "Clean update changed the binary"
 
     saved_receipt = RECEIPT.with_name(RECEIPT.name + ".test-backup")
@@ -460,7 +468,7 @@ def check_installer(script, build, account):
         install(True)
     check_installer_groups(install, build, account)
     print("PASS installer: root ownership/capabilities, clean update, changed/untracked/symlink "
-          "refusal, shared and reassigned groups")
+          "refusal, shared and reassigned groups, explicit extended grant and removal")
 
 
 def check_installer_groups(install, build, account):

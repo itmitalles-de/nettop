@@ -68,7 +68,8 @@ AF_PACKET sees published-port traffic before Docker's DNAT.
 
 `capture.rs` owns a single dynamically loaded, non-promiscuous libpcap session
 and its worker thread. It captures a bounded prefix for parsing headers, stores
-only flow byte counts, and closes its own worker/handle on drop. SLL2 interface
+only flow byte counts (or bounded header-only packet timestamps for the optional
+extended build), and closes its own worker/handle on drop. SLL2 interface
 indexes make device filtering explicit. Queue and capture drops remain visible
 as per-snapshot deltas (wrapping pcap_stats counters), as do unsupported or
 unreadable packets, so a past burst does not taint later snapshots.
@@ -117,3 +118,52 @@ the source repository is also public under GPL-3.0-or-later. `nettop.wutz.io` is
 CNAME to `itmitalles-de.github.io`, with HTTPS enforced by Pages. Deployment checks
 the public HTTPS endpoint. The site uses local fonts and explicit DEMO
 captures as intentional public product assets; local QA evidence stays outside Git.
+
+## Optional extended attribution
+
+Cargo feature `ebpf` embeds a CO-RE object built from `bpf/lifecycle.bpf.c`.
+`events.rs` dynamically loads libbpf, owns tracing links and a bounded ring
+consumer, and drops its worker capabilities after attach. No kernel pointers or
+payloads cross the event ABI. Hooks observe process-context bind, connect,
+accept, send, receive and final release. Actorless TCP-child birth events cover
+queued receive data before accept; final kernel socket freeing removes IDs of
+children that were never accepted. Socket IDs and full process start times
+separate reuse. `event_owners.rs` indexes bounded, direction-specific syscall
+windows; a closed socket with one observed actor also supplies its observed
+lifetime for packets queued before receive. Conflicting actors, event losses and
+clock uncertainty suppress ownership. Competing bound UDP sockets veto inferred
+receive lifetimes even if they never report a peer. A unique open event candidate
+outside its syscall window requires corroboration by a current descriptor with
+the same inode and process identity, plus proven conntrack endpoints.
+This is not proof of exclusive descriptor
+ownership; inventory evidence of sharing vetoes event matches.
+
+`conntrack.rs` maintains a bounded ctnetlink snapshot with event subscription,
+periodic resynchronization, zones, bidirectional translation and expiry. Loss or
+partial dumps invalidate the view. Six-second tuple tombstones survive resync
+and withhold translations across deletion/reuse; after event loss the restored
+view is quarantined as well, so deferred packets cannot inherit a new NAT target.
+Its worker alone retains NET_ADMIN.
+`sockets.rs` optionally discovers namespace-scoped inventories via bounded
+`/proc/PID/net` reads, verifying namespace identity before and after, without
+setns or SYS_ADMIN. `links.rs` identifies actual veth devices through rtnetlink.
+
+`extended.rs` combines independent endpoint evidence, translating sender and
+receiver against conntrack's original/reply tuples. Unproven raw endpoints never
+fall back to an unrelated sampled host listener. Equal SO_REUSEPORT owners credit
+only the process. Foreign endpoints contribute to All at the host veth boundary;
+selected-interface accounting retains other observations. Container loopback and
+non-veth namespace paths remain capture boundaries. Pending packets wait at most
+two seconds; known and unknown directions are recorded once. Capture begins
+before the initial descriptor scan. Packet realtime timestamps are mapped to the
+BPF monotonic clock, with quarantine after detected wall-clock steps.
+Untracked/NOTRACK flows can lack queued receive attribution on long-lived sockets;
+missing confirmed conntrack entries are reported per interval. A completed dump
+cannot prove absence of NAT for a packet still unconfirmed before PREROUTING, so
+the collector never converts a missing mapping into a guessed unchanged tuple.
+
+Both installer scripts require `--extended-attribution` to opt in. Standard
+builds do not require clang/libbpf or extra capabilities. Runtime status exposes
+backend errors and drops; F1/JSON distinguish extended from sampled collection.
+VM-only `tests/extended.py` and `tests/namespaces.py` exercise short TCP/UDP
+lifetimes, exited owners, namespace paths and NAT without tracing the host.

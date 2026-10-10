@@ -2,6 +2,16 @@
 
 #[path = "capture.rs"]
 mod capture;
+#[path = "conntrack.rs"]
+mod conntrack;
+#[path = "event_owners.rs"]
+mod event_owners;
+#[path = "events.rs"]
+mod events;
+#[path = "extended.rs"]
+mod extended;
+#[path = "links.rs"]
+mod links;
 #[path = "packet.rs"]
 mod packet;
 #[path = "sockets.rs"]
@@ -134,6 +144,7 @@ struct Deltas {
 /// Capture problems observed since the previous snapshot.
 #[derive(Default)]
 struct IntervalStatus {
+    timestamp_invalid: u64,
     dropped: u64,
     overflow: u64,
     unsupported: u64,
@@ -166,6 +177,7 @@ struct Attribution {
     capture_error: Option<String>,
     deferred: HashMap<(Flow, bool), Deferred>,
     worker_error: Option<String>,
+    extended: Option<extended::Extended>,
 }
 
 fn lock(shared: &Mutex<Attribution>) -> MutexGuard<'_, Attribution> {
@@ -236,7 +248,8 @@ impl Collector {
     pub fn new(capture_enabled: bool) -> Result<Self> {
         let started = Instant::now();
         let mut inventory = Inventory::new();
-        inventory.refresh();
+        let extended = (capture_enabled && cfg!(feature = "ebpf")).then(extended::Extended::start);
+        inventory.set_namespace_discovery(extended.as_ref().is_some_and(|e| e.available()));
         let interfaces = read_interfaces()?;
         let previous_interfaces = interfaces
             .iter()
@@ -268,7 +281,13 @@ impl Collector {
         } else {
             (None, Some(CaptureNote::Disabled))
         };
+        // Open capture before the potentially expensive initial descriptor
+        // scan. Traffic during that scan must reach the normal bounded flow
+        // queue instead of disappearing before capture starts.
+        inventory.refresh();
         let start_worker = capture.is_some();
+        let mut attribution = Attribution::new(inventory, capture);
+        attribution.extended = extended;
         Ok(Self {
             started,
             last_sample,
@@ -276,7 +295,7 @@ impl Collector {
             capture_note,
             start_worker,
             worker: None,
-            shared: Arc::new(Mutex::new(Attribution::new(inventory, capture))),
+            shared: Arc::new(Mutex::new(attribution)),
         })
     }
 
@@ -376,6 +395,30 @@ impl Collector {
                 }];
             }
         }
+        if let Some(extended) = &state.extended {
+            if extended.available() {
+                status.notes.retain(|note| *note != CaptureNote::Sampled);
+                status.notes.push(CaptureNote::Extended);
+            }
+            if extended.available() && problems.timestamp_invalid > 0 {
+                status.notes.push(CaptureNote::ExtendedIssue {
+                    detail: format!(
+                        "{} packet timestamps unavailable; uncertain event owners withheld",
+                        problems.timestamp_invalid
+                    ),
+                });
+            }
+            for detail in &extended.issues {
+                status.notes.push(CaptureNote::ExtendedIssue {
+                    detail: detail.clone(),
+                });
+            }
+            if extended.unconfirmed.replace(false) {
+                status.notes.push(CaptureNote::ExtendedIssue {
+                    detail: "no confirmed conntrack entry for some flows; only positive socket events can attribute them".into(),
+                });
+            }
+        }
         if state.inventory.restricted {
             status.notes.push(CaptureNote::OwnersInaccessible);
         }
@@ -416,6 +459,7 @@ impl Attribution {
             capture_error: None,
             deferred: HashMap::new(),
             worker_error: None,
+            extended: None,
         }
     }
 
@@ -434,21 +478,38 @@ impl Attribution {
         self.inventory.refresh();
         let view = LocalView::new(interfaces);
         let now = Instant::now();
+        if let Some(extended) = &mut self.extended {
+            extended.refresh(&self.inventory);
+        }
         self.status.dropped = self.status.dropped.saturating_add(batch.dropped);
         self.status.overflow = self.status.overflow.saturating_add(batch.overflow);
         self.status.unsupported = self.status.unsupported.saturating_add(batch.unsupported);
         self.status.truncated = self.status.truncated.saturating_add(batch.truncated);
+        self.status.timestamp_invalid = self
+            .status
+            .timestamp_invalid
+            .saturating_add(batch.timestamp_invalid);
         if batch.error.is_some() {
             self.capture_error = batch.error;
         }
         for ((flow, receive), deferred) in std::mem::take(&mut self.deferred) {
             self.attribute(&flow, receive, deferred.bytes, deferred.since, now, &view);
         }
-        for (flow, bytes) in batch.flows {
+        if let Some(extended) = &mut self.extended {
+            let pending = std::mem::take(&mut extended.pending);
+            for item in pending {
+                self.attribute_extended(item.flow, item.bytes, item.since, now, &view);
+            }
+        }
+        for (flow, bytes) in batch.flows.into_iter().chain(batch.timed_flows) {
+            if self.extended.as_ref().is_some_and(|e| e.available()) {
+                self.attribute_extended(flow, bytes, drained, now, &view);
+                continue;
+            }
             let (rx, tx) = traffic_sides(&flow, &view);
             for receive in [false, true] {
                 if (receive && rx) || (!receive && tx) {
-                    self.attribute(&flow, receive, bytes, drained, now, &view);
+                    self.attribute(&flow, receive, bytes.bytes, drained, now, &view);
                 }
             }
         }
@@ -471,6 +532,97 @@ impl Attribution {
             self.counters
                 .record_unknown(Link::plain(index), bytes, now, &mut self.deltas.unknown);
         }
+    }
+
+    fn attribute_extended(
+        &mut self,
+        flow: Flow,
+        bytes: capture::TimedBytes,
+        since: Instant,
+        now: Instant,
+        view: &LocalView,
+    ) {
+        let extended = self.extended.as_mut().expect("extended path");
+        let expired = now.saturating_duration_since(since) >= Duration::from_secs(2);
+        match extended.resolve(&flow, bytes, &self.inventory, view, expired) {
+            extended::Result::Owned(owners, unresolved) => {
+                for (socket, receive, lower, connection_known) in owners {
+                    let increment = if receive {
+                        Bytes {
+                            rx: bytes.bytes,
+                            tx: 0,
+                        }
+                    } else {
+                        Bytes {
+                            rx: 0,
+                            tx: bytes.bytes,
+                        }
+                    };
+                    let link = Link {
+                        index: flow.interface_index,
+                        lower,
+                    };
+                    if !self.counters.record_owned(
+                        link,
+                        &socket,
+                        connection_known,
+                        increment,
+                        now,
+                        &mut self.deltas,
+                    ) {
+                        self.counters.record_unknown(
+                            link,
+                            increment,
+                            now,
+                            &mut self.deltas.unknown,
+                        );
+                    }
+                }
+                for (receive, lower) in unresolved {
+                    let increment = if receive {
+                        Bytes {
+                            rx: bytes.bytes,
+                            tx: 0,
+                        }
+                    } else {
+                        Bytes {
+                            rx: 0,
+                            tx: bytes.bytes,
+                        }
+                    };
+                    self.counters.record_unknown(
+                        Link {
+                            index: flow.interface_index,
+                            lower,
+                        },
+                        increment,
+                        now,
+                        &mut self.deltas.unknown,
+                    );
+                }
+                return;
+            }
+            extended::Result::Pending if !expired && extended.pending.len() < MAX_DEFERRED => {
+                extended
+                    .pending
+                    .push(extended::Pending { flow, bytes, since });
+                return;
+            }
+            extended::Result::Pending if !expired => {
+                self.status.overflow = self.status.overflow.saturating_add(1);
+            }
+            _ => {}
+        }
+        let (rx, tx) = traffic_sides(&flow, view);
+        self.counters.record_unknown(
+            Link::plain(flow.interface_index),
+            Bytes {
+                rx: if rx { bytes.bytes } else { 0 },
+                tx: if tx { bytes.bytes } else { 0 },
+            },
+            now,
+            &mut self.deltas.unknown,
+        );
     }
 
     /// How long a flow may wait for its socket's owner: until the next owner
@@ -1364,6 +1516,7 @@ mod tests {
         let mut attribution = Attribution::new(Inventory::new(), None);
         let socket = Socket {
             key: SocketKey {
+                namespace: Inventory::new().host_namespace(),
                 inode: 321,
                 protocol: Protocol::Tcp,
                 local: "192.0.2.1:23456".parse().unwrap(),
@@ -1422,6 +1575,7 @@ mod tests {
         let mut attribution = Attribution::new(Inventory::new(), None);
         let mut socket = Socket {
             key: SocketKey {
+                namespace: Inventory::new().host_namespace(),
                 inode: 123,
                 protocol: Protocol::Tcp,
                 local: "192.0.2.1:12345".parse().unwrap(),
@@ -1553,6 +1707,7 @@ mod tests {
     fn owned(local: &str, remote: &str, inode: u64, name: &str) -> Socket {
         Socket {
             key: SocketKey {
+                namespace: Inventory::new().host_namespace(),
                 inode,
                 protocol: Protocol::Tcp,
                 local: local.parse().unwrap(),

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# != 0 )); then
-    printf 'Usage: %s\n' "$0" >&2
+extended=0
+if (( $# == 1 )) && [[ "$1" == --extended-attribution ]]; then
+    extended=1
+elif (( $# != 0 )); then
+    printf 'Usage: %s [--extended-attribution]\n' "$0" >&2
     exit 2
 fi
 
@@ -58,8 +61,28 @@ check_destination() {
     fi
 }
 
+build_options=()
+if (( extended )); then
+    bpf_clang="${NETTOP_BPF_CLANG:-clang}"
+    if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
+        ! "$bpf_clang" --print-targets 2>/dev/null | grep -q 'bpfel'; then
+        printf 'Extended attribution requires clang with the bpfel target; install clang or set NETTOP_BPF_CLANG.\n' >&2
+        exit 1
+    fi
+    if ! "$bpf_clang" -E -x c - >/dev/null 2>&1 <<'HEADERS'
+#include <linux/types.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
+HEADERS
+    then
+        printf 'Extended attribution requires libbpf-dev and Linux UAPI headers; install these build dependencies first.\n' >&2
+        exit 1
+    fi
+    build_options=(--features ebpf)
+fi
 check_destination
-cargo build --release --locked --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+cargo build --release --locked "${build_options[@]}" --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
 mkdir -p -- "$install_dir"
 staged_binary="$(mktemp "$install_dir/.nettop-binary.XXXXXX")"
 staged_receipt="$(mktemp "$install_dir/.nettop-receipt.XXXXXX")"
@@ -74,4 +97,6 @@ mv -- "$staged_binary" "$destination"
 staged_binary=''
 mv -- "$staged_receipt" "$receipt"
 staged_receipt=''
-printf 'Installed %s\nStart: %s\nOptional one-time capture setup: %s/scripts/setup-capture.sh\n' "$destination" "$destination" "$repo_dir"
+setup_option=''
+if (( extended )); then setup_option=' --extended-attribution'; fi
+printf 'Installed %s\nStart: %s\nOptional one-time capture setup: %s/scripts/setup-capture.sh%s\n' "$destination" "$destination" "$repo_dir" "$setup_option"

@@ -79,6 +79,11 @@ pub enum CaptureNote {
     AllInterfaces,
     /// The routine explanation; the UI keeps it in F1 Help only.
     Sampled,
+    /// Optional socket events, namespace inventory and NAT metadata.
+    Extended,
+    ExtendedIssue {
+        detail: String,
+    },
     PcapMissed {
         packets: u64,
     },

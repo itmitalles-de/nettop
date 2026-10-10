@@ -101,7 +101,7 @@ check_destination() {
 }
 
 if [[ "${1:-}" == --install ]]; then
-    (( EUID == 0 && $# == 7 )) || fail 'Internal installation requires root, --install and six parameters.'
+    (( EUID == 0 && $# == 8 )) || fail 'Internal installation requires root, --install and seven parameters.'
     # Do not inherit tool lookup or a permissive umask from the invoking user.
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     umask 077
@@ -111,8 +111,12 @@ if [[ "${1:-}" == --install ]]; then
     expected_digest="$5"
     allow_shared="$6"
     reassign="$7"
+    extended="$8"
     [[ "$owner_uid" =~ ^[0-9]+$ && "$owner_uid" != 0 && "$owner_gid" =~ ^[0-9]+$ && "$owner_gid" != 0 ]] || fail 'Capture access must belong to a non-root user and primary group.'
-    [[ "$allow_shared" =~ ^[01]$ && "$reassign" =~ ^[01]$ ]] || fail 'Invalid installation options.'
+    [[ "$allow_shared" =~ ^[01]$ && "$reassign" =~ ^[01]$ && "$extended" =~ ^[01]$ ]] || fail 'Invalid installation options.'
+    if [[ "$extended" == 1 ]]; then
+        capabilities=cap_dac_read_search,cap_net_raw,cap_sys_ptrace,cap_net_admin,cap_bpf,cap_perfmon=ep
+    fi
     [[ "$(id -g -- "$owner_uid")" == "$owner_gid" ]] || fail 'Capture group must be the specified primary group.'
     # Sanity checks only: the digest of the root-owned copy is what counts.
     [[ "$expected_digest" =~ ^[[:xdigit:]]{64}$ && -f "$binary" && ! -L "$binary" ]] || fail 'Invalid helper build or digest.'
@@ -153,13 +157,15 @@ if [[ "${1:-}" == --install ]]; then
     exit 0
 fi
 
-usage="Usage: $0 [--allow-shared-group] [--reassign-group]"
+usage="Usage: $0 [--extended-attribution] [--allow-shared-group] [--reassign-group]"
 allow_shared=0
 reassign=0
+extended=0
 for option in "$@"; do
     case "$option" in
         --allow-shared-group) allow_shared=1 ;;
         --reassign-group) reassign=1 ;;
+        --extended-attribution) extended=1 ;;
         *) fail "$usage" ;;
     esac
 done
@@ -167,16 +173,38 @@ done
 # Fail before building and authenticating; the root phase checks again.
 check_group "$(id -u)" "$(id -g)" "$allow_shared" "$reassign"
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-cargo build --release --locked --bin nettop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
+build_options=()
+if (( extended )); then
+    bpf_clang="${NETTOP_BPF_CLANG:-clang}"
+    if ! command -v "$bpf_clang" >/dev/null 2>&1 ||
+        ! "$bpf_clang" --print-targets 2>/dev/null | grep -q 'bpfel'; then
+        fail 'Extended attribution requires clang with the bpfel target; install clang or set NETTOP_BPF_CLANG.'
+    fi
+    if ! "$bpf_clang" -E -x c - >/dev/null 2>&1 <<'HEADERS'
+#include <linux/types.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
+HEADERS
+    then
+        fail 'Extended attribution requires libbpf-dev and Linux UAPI headers; install these build dependencies first.'
+    fi
+    build_options=(--features ebpf)
+fi
+cargo build --release --locked "${build_options[@]}" --bin nettop-collector --manifest-path "$repo_dir/Cargo.toml" --target-dir "$repo_dir/target"
 binary="$repo_dir/target/release/nettop-collector"
 read -r digest _ < <(sha256sum -- "$binary")
 printf 'One-time setup: install %s with capture and /proc read capabilities.\n' "$destination"
+if (( extended )); then
+    printf 'Extended attribution also grants BPF, PERFMON and NET_ADMIN capabilities for socket events and conntrack.\n'
+    printf 'To remove those extra capabilities, rerun both installation scripts without --extended-attribution.\n'
+fi
 printf 'Every member of your primary group (%s) can use it. The terminal UI stays unprivileged.\n' "$(id -gn)"
 printf 'Authenticating trusts this checkout: the administrator runs this script and installs your build.\n'
 if command -v pkexec >/dev/null 2>&1; then
-    exec pkexec /usr/bin/bash "$repo_dir/scripts/setup-capture.sh" --install "$binary" "$(id -u)" "$(id -g)" "$digest" "$allow_shared" "$reassign"
+    exec pkexec /usr/bin/bash "$repo_dir/scripts/setup-capture.sh" --install "$binary" "$(id -u)" "$(id -g)" "$digest" "$allow_shared" "$reassign" "$extended"
 elif command -v sudo >/dev/null 2>&1; then
-    exec sudo /usr/bin/bash "$repo_dir/scripts/setup-capture.sh" --install "$binary" "$(id -u)" "$(id -g)" "$digest" "$allow_shared" "$reassign"
+    exec sudo /usr/bin/bash "$repo_dir/scripts/setup-capture.sh" --install "$binary" "$(id -u)" "$(id -g)" "$digest" "$allow_shared" "$reassign" "$extended"
 else
     fail 'Administrator authentication is unavailable; install pkexec or sudo to perform the one-time setup.'
 fi

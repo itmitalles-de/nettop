@@ -8,6 +8,10 @@ description = "An nvtop-inspired Linux network monitor with live graphs and per-
 license = "GPL-3.0-or-later"
 repository = "https://github.com/itmitalles-de/nettop"
 
+[features]
+default = []
+ebpf = []
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }

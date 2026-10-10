@@ -243,23 +243,147 @@ fn dropped_since(previous: &PcapStats, current: &PcapStats) -> u64 {
         )
 }
 
+/// Kernel-clock bounds for all packets aggregated under one tuple. A tuple
+/// spanning two socket incarnations is deliberately not split by guesswork.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TimedBytes {
+    pub bytes: u64,
+    pub first: u64,
+    pub last: u64,
+}
+
+impl TimedBytes {
+    fn add(&mut self, bytes: u64, timestamp: u64) {
+        if self.bytes == 0 {
+            self.first = timestamp;
+            self.last = timestamp;
+        } else if timestamp == 0 || self.first == 0 {
+            self.first = 0;
+            self.last = 0;
+        } else {
+            self.first = self.first.min(timestamp);
+            self.last = self.last.max(timestamp);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+pub(super) fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    (time.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(time.tv_nsec as u64)
+}
+
+/// Tracks realtime/monotonic correspondence across pcap drains. Clock steps
+/// invalidate timestamps for the maximum accepted packet age, so an old header
+/// cannot be moved into another socket's lifetime by a new wall-clock offset.
+struct TimestampClock {
+    offset: i128,
+    sampled: u64,
+    invalid_until: u64,
+}
+impl TimestampClock {
+    fn new() -> Self {
+        let mut clock = Self {
+            offset: 0,
+            sampled: 0,
+            invalid_until: 0,
+        };
+        clock.refresh();
+        clock
+    }
+    fn observe(&mut self, mono: u64, realtime: i128, uncertainty: u64) {
+        let offset = realtime - i128::from(mono);
+        let elapsed = mono.saturating_sub(self.sampled);
+        // Allow normal clock slewing plus sampling jitter; an abrupt offset
+        // change causes conservative suppression, never best-guess remapping.
+        if uncertainty > 10_000
+            || (self.sampled != 0
+                && (offset - self.offset).unsigned_abs() > u128::from(50_000 + elapsed / 1000))
+        {
+            self.invalid_until = mono.saturating_add(3_000_000_000);
+        }
+        self.offset = offset;
+        self.sampled = mono;
+    }
+    fn refresh(&mut self) {
+        let before = monotonic_ns();
+        let mut real = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ok = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut real) } == 0;
+        let after = monotonic_ns();
+        if !ok {
+            self.invalid_until = after.saturating_add(3_000_000_000);
+            return;
+        }
+        self.observe(
+            before + (after - before) / 2,
+            i128::from(real.tv_sec) * 1_000_000_000 + i128::from(real.tv_nsec),
+            after - before,
+        );
+    }
+    fn convert(&self, timestamp: &libc::timeval) -> u64 {
+        if self.sampled < self.invalid_until || !(0..1_000_000).contains(&timestamp.tv_usec) {
+            return 0;
+        }
+        let realtime =
+            i128::from(timestamp.tv_sec) * 1_000_000_000 + i128::from(timestamp.tv_usec) * 1000;
+        let translated = realtime - self.offset;
+        if translated <= 0
+            || translated > i128::from(self.sampled) + 10_000
+            || i128::from(self.sampled) - translated > 3_000_000_000
+        {
+            0
+        } else {
+            translated as u64
+        }
+    }
+}
+
 /// Captured flows plus the capture problems observed since the previous drain.
 #[derive(Default)]
 pub(super) struct Batch {
-    pub flows: HashMap<Flow, u64>,
+    pub flows: HashMap<Flow, TimedBytes>,
+    /// Extended mode preserves individual header-only observations so a TCP
+    /// handshake cannot widen a data packet beyond its actor syscall window.
+    pub timed_flows: Vec<(Flow, TimedBytes)>,
     pub untracked: HashMap<(u32, Direction), Untracked>,
     pub dropped: u64,
     pub overflow: u64,
     pub unsupported: u64,
     pub truncated: u64,
     pub error: Option<String>,
+    pub timestamp_invalid: u64,
 }
 
 impl Batch {
-    fn push(&mut self, packet: Packet) {
-        if self.flows.len() < MAX_FLOWS || self.flows.contains_key(&packet.flow) {
+    fn push(&mut self, packet: Packet, timestamp: u64) {
+        if cfg!(feature = "ebpf") && timestamp == 0 {
+            self.timestamp_invalid = self.timestamp_invalid.saturating_add(1);
+        }
+        if cfg!(feature = "ebpf") && self.timed_flows.len() < MAX_FLOWS {
+            self.timed_flows.push((
+                packet.flow,
+                TimedBytes {
+                    bytes: packet.bytes,
+                    first: timestamp,
+                    last: timestamp,
+                },
+            ));
+        } else if !cfg!(feature = "ebpf")
+            && (self.flows.len() < MAX_FLOWS || self.flows.contains_key(&packet.flow))
+        {
             let bytes = self.flows.entry(packet.flow).or_default();
-            *bytes = bytes.saturating_add(packet.bytes);
+            bytes.add(packet.bytes, timestamp);
         } else {
             self.overflow = self.overflow.saturating_add(1);
             let key = (packet.flow.interface_index, packet.flow.direction);
@@ -289,6 +413,7 @@ impl Capture {
         let worker = thread::Builder::new()
             .name("nettop-capture".to_string())
             .spawn(move || {
+                let mut clock = TimestampClock::new();
                 let session = match Session::open() {
                     Ok(session) => session,
                     Err(error) => {
@@ -311,6 +436,7 @@ impl Capture {
                 let mut fragments = Fragments::default();
                 let mut fragments_expired_at = Instant::now();
                 while !thread_stop.load(Ordering::Relaxed) {
+                    clock.refresh();
                     let mut packets = Vec::with_capacity(256);
                     let mut unsupported = 0_u64;
                     let mut truncated = 0_u64;
@@ -339,14 +465,15 @@ impl Capture {
                             )
                         };
                         match packet::parse(captured, header.len, session.datalink) {
-                            Ok(packet) => packets.push(packet),
+                            Ok(packet) => packets.push((packet, header.timestamp)),
                             Err(packet::ParseError::Unsupported) => unsupported += 1,
                             Err(_) => truncated += 1,
                         }
                     }
+                    clock.refresh();
                     let idle = packets.is_empty() && unsupported == 0 && truncated == 0;
                     let now = Instant::now();
-                    for packet in &mut packets {
+                    for (packet, _) in &mut packets {
                         fragments.apply(packet, now);
                     }
                     if now.saturating_duration_since(fragments_expired_at) >= FRAGMENT_LIFETIME {
@@ -354,8 +481,8 @@ impl Capture {
                         fragments_expired_at = now;
                     }
                     if let Ok(mut buffer) = thread_buffer.lock() {
-                        for packet in packets {
-                            buffer.push(packet);
+                        for (packet, timestamp) in packets {
+                            buffer.push(packet, clock.convert(&timestamp));
                         }
                         buffer.unsupported = buffer.unsupported.saturating_add(unsupported);
                         buffer.truncated = buffer.truncated.saturating_add(truncated);
@@ -412,12 +539,14 @@ impl Capture {
         };
         Batch {
             flows: std::mem::take(&mut buffer.flows),
+            timed_flows: std::mem::take(&mut buffer.timed_flows),
             untracked: std::mem::take(&mut buffer.untracked),
             dropped: std::mem::take(&mut buffer.dropped),
             overflow: std::mem::take(&mut buffer.overflow),
             unsupported: std::mem::take(&mut buffer.unsupported),
             truncated: std::mem::take(&mut buffer.truncated),
             error: buffer.error.clone(),
+            timestamp_invalid: std::mem::take(&mut buffer.timestamp_invalid),
         }
     }
 }
@@ -437,24 +566,53 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
+    fn realtime_steps_cannot_move_packets_into_another_lifetime() {
+        let mut c = TimestampClock {
+            offset: 0,
+            sampled: 0,
+            invalid_until: 0,
+        };
+        c.observe(10_000_000_000, 100_000_000_000, 100);
+        let packet = libc::timeval {
+            tv_sec: 100,
+            tv_usec: 0,
+        };
+        assert_eq!(c.convert(&packet), 10_000_000_000);
+        c.observe(10_100_000_000, 100_600_000_000, 100);
+        assert_eq!(c.convert(&packet), 0);
+        c.observe(13_200_000_000, 103_700_000_000, 100);
+        assert_eq!(c.convert(&packet), 0, "old packet is outside maximum age");
+        assert_eq!(
+            c.convert(&libc::timeval {
+                tv_sec: 103,
+                tv_usec: 700_000
+            }),
+            13_200_000_000
+        );
+    }
+
+    #[test]
     fn flow_storage_is_bounded_and_excess_bytes_remain_visible() {
         let mut batch = Batch::default();
         for port in 0..MAX_FLOWS + 1 {
-            batch.push(Packet {
-                flow: Flow {
-                    source: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    destination: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    source_port: Some(port as u16),
-                    destination_port: Some(123),
-                    protocol: Protocol::Udp,
-                    interface_index: 1,
-                    direction: Direction::Outgoing,
+            batch.push(
+                Packet {
+                    flow: Flow {
+                        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        destination: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        source_port: Some(port as u16),
+                        destination_port: Some(123),
+                        protocol: Protocol::Udp,
+                        interface_index: 1,
+                        direction: Direction::Outgoing,
+                    },
+                    bytes: 128,
+                    fragment: None,
                 },
-                bytes: 128,
-                fragment: None,
-            });
+                1,
+            );
         }
-        assert_eq!(batch.flows.len(), MAX_FLOWS);
+        assert_eq!(batch.flows.len() + batch.timed_flows.len(), MAX_FLOWS);
         assert_eq!(batch.overflow, 1);
         assert_eq!(
             batch
