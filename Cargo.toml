@@ -5,7 +5,7 @@ edition = "2024"
 default-run = "nettop"
 rust-version = "1.88"
 description = "An nvtop-inspired Linux network monitor with live graphs and per-process traffic"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/itmitalles-de/nettop"
 
 [dependencies]

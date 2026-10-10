@@ -12,7 +12,7 @@
 <p align="center">
   <img src="site/assets/badge-linux.svg" alt="Platform: Linux">
   <a href="Cargo.toml"><img src="site/assets/badge-rust.svg" alt="Rust 1.88 or newer"></a>
-  <a href="LICENSE"><img src="site/assets/badge-license.svg" alt="MIT license"></a>
+  <a href="LICENSE"><img src="site/assets/badge-license.svg" alt="License: GPL-3.0-or-later"></a>
 </p>
 
 <p align="center">
@@ -48,7 +48,8 @@ Interface counters also work without that setup.
 
 You need **Linux**, **Rust 1.88+**, and the **libpcap runtime** for process capture.
 A libpcap development package is not required. The source is public and
-[MIT licensed](LICENSE); cloning does not require a GitHub account.
+licensed under the [GNU GPL v3 or later](LICENSE); cloning does not require a
+GitHub account.
 
 ```bash
 # Ubuntu 24.04 and newer: capture runtime and capability tools.
@@ -272,7 +273,19 @@ The [project website](https://nettop.wutz.io) is a dependency-free static site i
 [`site/`](site/), published by the [Pages workflow](.github/workflows/pages.yml).
 Its terminal images and recording use explicit DEMO mode with synthetic traffic.
 
+## License
+
+Copyright (C) 2026 itmitalles
+
+nettop is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version (SPDX: `GPL-3.0-or-later`). nettop is distributed in the hope that it
+will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for
+the full license text.
+
 ---
 
-[MIT licensed](LICENSE) · Inspired by htop and nvtop · No affiliation with other
+[GPL-3.0-or-later](LICENSE) · Inspired by htop and nvtop · No affiliation with other
 projects named nettop or ntop.

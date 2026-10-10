@@ -8,7 +8,7 @@ captures or desktop screenshots.
 
 `mark.svg`, `readme-banner.svg` and `badge-*.svg` are original vector artwork. `social-card.png`
 combines the product branding with the DEMO terminal image. Project artwork is
-covered by the repository's MIT license.
+covered by the repository's license, GPL-3.0-or-later.
 
 The fonts in `fonts/` are self-hosted Chivo and IBM Plex Mono. Their source URLs
 and SIL Open Font License notices are included in that directory.

@@ -1,6 +1,7 @@
 # Verified state
 
-- Public, MIT-licensed repository: `itmitalles-de/nettop`, branch `main`.
+- Public repository `itmitalles-de/nettop`, branch `main`, licensed
+  GPL-3.0-or-later (owner relicensed from MIT on 2026-10-10).
 - Rust 1.88+ Linux binary, runtime-loaded libpcap; no libpcap development package.
 - Native ANSI htop/nvtop styling: green RX, yellow TX, stepped history graph,
   inverse green headers, cyan selection and function-key bar. F2 opens persistent
