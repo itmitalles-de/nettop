@@ -1,5 +1,44 @@
 # Verified state
 
+## Optional attribution implementation (2026-10-10)
+
+- Work branch `fix/attribution-limits`, based on `0de3644`.
+- Opt-in `ebpf` build adds socket lifecycle events, namespace inventories,
+  conntrack translation/reuse quarantine, veth deduplication and visible degraded
+  status. Both installer scripts accept `--extended-attribution`; standard
+  builds require neither clang/libbpf nor extra capabilities. Capture starts
+  before the initial descriptor scan. Captured IP packets remain the byte source.
+- Extended helper grants BPF, PERFMON and NET_ADMIN in addition to the standard
+  capture/read capabilities. BPF and capture workers drop all capabilities;
+  conntrack retains only NET_ADMIN and sampling only process-read capabilities.
+  VM checks verified the unprivileged UI, exact per-thread limits, NO_NEW_PRIVS
+  and complete helper/probe cleanup. No permanent service or pinned BPF object.
+- Linux 6.8 x86_64 VM tests cover sub-millisecond TCP/UDP IPv4/IPv6 sockets,
+  exited owners, and 16 positive namespace/NAT cases (tracked direct, DNAT, SNAT,
+  combined NAT and host hairpin, All and selected interfaces). Separate negative
+  cases passed with conservative untracked-flow attribution and a visible notice.
+  One earlier VM run rejected five uncertain timestamps; an unchanged repeat
+  passed. Preserve the log and extend stress coverage in #10.
+  ARM64 BPF compilation passed; runtime coverage remains x86_64.
+- Standard terminal/setup, isolated live TCP/UDP, short-socket and capability
+  helper checks passed, including extended-build fallback without extra rights.
+  Formatting, Clippy in both configurations, Rust tests including 1.88.0,
+  ShellCheck and Cargo Audit passed. CI adds optional-feature compilation/tests.
+- Remaining work: [#8](https://github.com/itmitalles-de/nettop/issues/8)
+  untracked long-lived flows, [#9](https://github.com/itmitalles-de/nettop/issues/9)
+  namespace capture boundaries, [#10](https://github.com/itmitalles-de/nettop/issues/10)
+  further adversarial/kernel runtime coverage. Missing conntrack mappings never
+  prove absence of NAT, and nettop does not change firewall rules.
+- Host build dependencies clang/libbpf-dev are installed. Local activation and
+  merged CI verification still follow this implementation; installed binaries
+  currently remain the completed baseline below.
+- Private evidence and the dedicated QEMU guest are outside Git under
+  `../nettop-review/issue-2/`; use generated VM wrappers/current PID files,
+  never stale ports. Retain evidence, stop the guest after validation, and keep
+  credentials and raw runtime snapshots out of Git.
+
+## Completed baseline
+
 - Public repository `itmitalles-de/nettop`, branch `main`, licensed
   GPL-3.0-or-later (owner relicensed from MIT on 2026-10-10).
 - Rust 1.88+ Linux binary, runtime-loaded libpcap; no libpcap development package.
@@ -65,8 +104,9 @@
 - `tests/helper.py` verified root-owned traffic from an unprivileged UI, exact
   per-thread capability limits, installer refusal cases, protocol bounds,
   signal/timeout cleanup with a stopped helper, and EOF cleanup after UI SIGKILL.
-- Owners are sampled; short-lived, shared and ambiguously reused sockets can
-  remain unattributed. Separate container network namespaces are not fully covered.
+- Standard-mode owners are sampled; short-lived, shared and ambiguously reused
+  sockets can remain unattributed. Extended-mode coverage and remaining namespace
+  boundaries are recorded above.
 - Local installation uses `scripts/install.sh`, which refuses to replace an
   unrelated executable. Only explicitly requested `--demo` uses synthetic data.
 - Completion verified on 2026-10-10: `main` fast-forwarded to `c887692`; the

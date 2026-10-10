@@ -3,12 +3,18 @@
 use super::packet::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MAX_SOCKETS: usize = 32_768;
+const MAX_NAMESPACES: usize = 128;
+const MAX_PROC_FILE: usize = 4 * 1024 * 1024;
+const MAX_PROC_BYTES: usize = 32 * 1024 * 1024;
+const NAMESPACE_DISCOVERY_GAP: Duration = Duration::from_secs(2);
 const MAX_PROCESSES: usize = 32_768;
 const MAX_FD_LINKS: usize = 262_144;
 const RETAIN_CLOSED: Duration = Duration::from_secs(3);
@@ -43,6 +49,8 @@ pub(super) struct Owner {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SocketKey {
+    /// Network namespace inode, as exposed by /proc/PID/ns/net.
+    pub namespace: u64,
     pub inode: u64,
     pub protocol: Protocol,
     pub local: SocketAddr,
@@ -126,9 +134,22 @@ enum DiagOutcome {
     Incomplete,
 }
 
-type ExactKey = (Protocol, SocketAddr, SocketAddr);
+/// A visible namespace and addresses verified from its kernel routing tables.
+#[derive(Clone, Debug)]
+pub(super) struct Namespace {
+    pub id: u64,
+    pub representative_pid: u32,
+    pub addresses: HashSet<IpAddr>,
+}
+
+type ExactKey = (u64, Protocol, SocketAddr, SocketAddr);
 
 pub(super) struct Inventory {
+    host_namespace: u64,
+    namespace_discovery: bool,
+    namespaces: HashMap<u64, Namespace>,
+    last_namespace_discovery: Option<Instant>,
+    namespace_flags: (bool, bool),
     pub sockets: Vec<Socket>,
     pub users: HashMap<u32, String>,
     /// Some socket tables or process descriptors were inaccessible during the
@@ -141,7 +162,7 @@ pub(super) struct Inventory {
     /// instead of scanning every connection sharing a busy local port.
     exact: HashMap<ExactKey, Vec<usize>>,
     /// Listeners, unconnected and wildcard sockets by local port.
-    by_port: HashMap<(Protocol, u16), Vec<usize>>,
+    by_port: HashMap<(u64, Protocol, u16), Vec<usize>>,
     owners: HashMap<u64, Vec<Owner>>,
     owner_keys: HashMap<u64, SocketKey>,
     owner_flags: (bool, bool),
@@ -170,7 +191,20 @@ impl Inventory {
                 ))
             })
             .collect();
+        let host_namespace = namespace_id(std::process::id()).unwrap_or(0);
         Self {
+            host_namespace,
+            namespace_discovery: false,
+            namespaces: HashMap::from([(
+                host_namespace,
+                Namespace {
+                    id: host_namespace,
+                    representative_pid: std::process::id(),
+                    addresses: HashSet::new(),
+                },
+            )]),
+            last_namespace_discovery: None,
+            namespace_flags: (false, false),
             sockets: Vec::new(),
             users,
             restricted: false,
@@ -199,31 +233,73 @@ impl Inventory {
         {
             return;
         }
-        let mut restricted = false;
-        let mut limited = false;
+        if self.namespace_discovery
+            && self
+                .last_namespace_discovery
+                .is_none_or(|last| now.saturating_duration_since(last) >= NAMESPACE_DISCOVERY_GAP)
+        {
+            let (discovered, restricted, limited) = discover_namespaces(self.host_namespace);
+            self.namespaces = discovered;
+            self.namespace_flags = (restricted, limited);
+            self.last_namespace_discovery = Some(now);
+        }
+        let (mut restricted, mut limited) = self.namespace_flags;
         let mut current = Vec::new();
-        for (path, protocol, ipv6) in [
-            ("/proc/net/tcp", Protocol::Tcp, false),
-            ("/proc/net/tcp6", Protocol::Tcp, true),
-            ("/proc/net/udp", Protocol::Udp, false),
-            ("/proc/net/udp6", Protocol::Udp, true),
-        ] {
-            match fs::read_to_string(path) {
-                Ok(contents) => {
-                    for line in contents.lines().skip(1) {
-                        if current.len() >= MAX_SOCKETS {
-                            limited = true;
-                            break;
-                        }
-                        if let Some(socket) = parse_socket(line, protocol, ipv6, now) {
-                            current.push(socket);
-                        }
+        let mut budget = MAX_PROC_BYTES;
+        // Always read the host first so many containers cannot crowd it out.
+        let mut ids: Vec<_> = self.namespaces.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| (*id != self.host_namespace, *id));
+        for id in ids {
+            let namespace = self
+                .namespaces
+                .get_mut(&id)
+                .expect("namespace collected above");
+            let pid = namespace.representative_pid;
+            if namespace_id(pid).ok() != Some(id) || id == 0 {
+                namespace.addresses.clear();
+                restricted = true;
+                continue;
+            }
+            let first = current.len();
+            let root = format!("/proc/{pid}/net");
+            for (file, protocol, ipv6) in [
+                ("tcp", Protocol::Tcp, false),
+                ("tcp6", Protocol::Tcp, true),
+                ("udp", Protocol::Udp, false),
+                ("udp6", Protocol::Udp, true),
+            ] {
+                let Some(contents) = read_proc_bounded(
+                    Path::new(&format!("{root}/{file}")),
+                    &mut budget,
+                    &mut restricted,
+                    &mut limited,
+                ) else {
+                    continue;
+                };
+                for line in contents.lines().skip(1) {
+                    if current.len() >= MAX_SOCKETS {
+                        limited = true;
+                        break;
+                    }
+                    if let Some(socket) = parse_socket(line, protocol, ipv6, now, id) {
+                        current.push(socket);
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    restricted = true
-                }
-                Err(_) => {}
+            }
+            if self.namespace_discovery {
+                namespace.addresses = read_namespace_addresses(
+                    Path::new(&root),
+                    &mut budget,
+                    &mut restricted,
+                    &mut limited,
+                );
+            }
+            // A process may exit, be reused, or change namespace while the files
+            // are read. Never publish a table under the wrong namespace identity.
+            if namespace_id(pid).ok() != Some(id) {
+                current.truncate(first);
+                namespace.addresses.clear();
+                restricted = true;
             }
         }
         self.refresh_owners(&current, now);
@@ -261,6 +337,32 @@ impl Inventory {
         self.restricted = restricted || owner_restricted;
         self.limited = limited || owner_limited;
         self.last_scan = Some(now);
+    }
+
+    pub(super) fn host_namespace(&self) -> u64 {
+        self.host_namespace
+    }
+
+    pub(super) fn namespaces(&self) -> &HashMap<u64, Namespace> {
+        &self.namespaces
+    }
+
+    /// Namespace discovery is deliberately opt-in; the standard sampling path
+    /// continues to inspect only its own network namespace.
+    pub(super) fn set_namespace_discovery(&mut self, enabled: bool) {
+        if self.namespace_discovery == enabled {
+            return;
+        }
+        self.namespace_discovery = enabled;
+        self.last_namespace_discovery = None;
+        self.last_scan = None;
+        if !enabled {
+            self.namespaces.retain(|id, _| *id == self.host_namespace);
+            self.sockets
+                .retain(|socket| socket.key.namespace == self.host_namespace);
+            self.namespace_flags = (false, false);
+            self.rebuild_index();
+        }
     }
 
     /// Descriptor scans are the expensive part. Scan promptly when sockets
@@ -338,7 +440,10 @@ impl Inventory {
     fn refresh_ipv6_modes(&mut self, current: &[Socket], now: Instant) {
         let wanted: HashMap<&SocketKey, u32> = current
             .iter()
-            .filter(|socket| socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            .filter(|socket| {
+                socket.key.namespace == self.host_namespace
+                    && socket.key.local.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            })
             .map(|socket| (&socket.key, state_mask(&socket.state, socket.key.protocol)))
             .collect();
         self.ipv6_modes.retain(|key, _| wanted.contains_key(key));
@@ -387,12 +492,12 @@ impl Inventory {
             let key = &socket.key;
             if !key.local.ip().is_unspecified() && !key.remote.ip().is_unspecified() {
                 self.exact
-                    .entry((key.protocol, key.local, key.remote))
+                    .entry((key.namespace, key.protocol, key.local, key.remote))
                     .or_default()
                     .push(index);
             } else {
                 self.by_port
-                    .entry((key.protocol, key.local.port()))
+                    .entry((key.namespace, key.protocol, key.local.port()))
                     .or_default()
                     .push(index);
             }
@@ -407,13 +512,25 @@ impl Inventory {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Resolution<'_> {
+        self.resolve_in(self.host_namespace, protocol, local, remote)
+    }
+
+    /// The caller must establish that this endpoint belongs to this namespace
+    /// before trying wildcard listeners (e.g. verified addresses or kernel events).
+    pub(super) fn resolve_in(
+        &self,
+        namespace: u64,
+        protocol: Protocol,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Resolution<'_> {
         let exact = self
             .exact
-            .get(&(protocol, local, remote))
+            .get(&(namespace, protocol, local, remote))
             .map_or(&[][..], Vec::as_slice);
         let wildcard = self
             .by_port
-            .get(&(protocol, local.port()))
+            .get(&(namespace, protocol, local.port()))
             .map_or(&[][..], Vec::as_slice);
         // After a local close the kernel keeps the same endpoint pair without
         // an inode (FIN-WAIT, TIME-WAIT, LAST-ACK). That remnant continues the
@@ -530,6 +647,160 @@ impl Inventory {
             .cloned()
             .unwrap_or_else(|| uid.to_string())
     }
+}
+
+fn namespace_id(pid: u32) -> std::io::Result<u64> {
+    fs::metadata(format!("/proc/{pid}/ns/net")).map(|metadata| metadata.ino())
+}
+
+fn discover_namespaces(host: u64) -> (HashMap<u64, Namespace>, bool, bool) {
+    let mut namespaces = HashMap::from([(
+        host,
+        Namespace {
+            id: host,
+            representative_pid: std::process::id(),
+            addresses: HashSet::new(),
+        },
+    )]);
+    let mut restricted = host == 0;
+    let mut limited = false;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return (namespaces, true, false);
+    };
+    let mut pids = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            restricted = true;
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pids.len() == MAX_PROCESSES {
+            limited = true;
+            break;
+        }
+        pids.push(pid);
+    }
+    // Prefer older representatives, usually the container's init process.
+    pids.sort_unstable();
+    for pid in pids {
+        match namespace_id(pid) {
+            Ok(id) if namespaces.contains_key(&id) => {}
+            Ok(id) => {
+                if namespaces.len() == MAX_NAMESPACES {
+                    limited = true;
+                    break;
+                }
+                namespaces.insert(
+                    id,
+                    Namespace {
+                        id,
+                        representative_pid: pid,
+                        addresses: HashSet::new(),
+                    },
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => restricted = true,
+        }
+    }
+    (namespaces, restricted, limited)
+}
+
+/// Kernel tables can grow with unrelated system activity. Bound both each
+/// allocation and aggregate bytes per refresh, rejecting incomplete files.
+fn read_proc_bounded(
+    path: &Path,
+    budget: &mut usize,
+    restricted: &mut bool,
+    limited: &mut bool,
+) -> Option<String> {
+    if *budget == 0 {
+        *limited = true;
+        return None;
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            *restricted = true;
+            return None;
+        }
+    };
+    let bound = MAX_PROC_FILE.min(*budget);
+    let mut contents = Vec::new();
+    if file
+        .take((bound + 1) as u64)
+        .read_to_end(&mut contents)
+        .is_err()
+    {
+        *budget = budget.saturating_sub(contents.len());
+        *restricted = true;
+        return None;
+    }
+    *budget = budget.saturating_sub(contents.len());
+    if contents.len() > bound {
+        *limited = true;
+        return None;
+    }
+    match String::from_utf8(contents) {
+        Ok(contents) => Some(contents),
+        Err(_) => {
+            *restricted = true;
+            None
+        }
+    }
+}
+
+fn read_namespace_addresses(
+    root: &Path,
+    budget: &mut usize,
+    restricted: &mut bool,
+    limited: &mut bool,
+) -> HashSet<IpAddr> {
+    let ipv4 = read_proc_bounded(&root.join("fib_trie"), budget, restricted, limited);
+    let ipv6 = read_proc_bounded(&root.join("if_inet6"), budget, restricted, limited);
+    namespace_addresses(ipv4.as_deref().unwrap_or(""), ipv6.as_deref().unwrap_or(""))
+}
+
+fn namespace_addresses(ipv4: &str, ipv6: &str) -> HashSet<IpAddr> {
+    let mut addresses = HashSet::new();
+    let mut leaf = None;
+    for line in ipv4.lines() {
+        let line = line.trim();
+        if let Some(address) = line.strip_prefix("|-- ") {
+            leaf = address.parse::<Ipv4Addr>().ok();
+        } else if line.split_ascii_whitespace().eq(["/32", "host", "LOCAL"]) {
+            if let Some(ip) = leaf.take() {
+                addresses.insert(IpAddr::V4(ip));
+            }
+        } else {
+            leaf = None;
+        }
+    }
+    for line in ipv6.lines() {
+        let fields: Vec<_> = line.split_ascii_whitespace().collect();
+        if fields.len() != 6 || fields[0].len() != 32 {
+            continue;
+        }
+        let (Ok(address), Ok(flags)) = (
+            u128::from_str_radix(fields[0], 16),
+            u32::from_str_radix(fields[4], 16),
+        ) else {
+            continue;
+        };
+        // DAD failure or a tentative address is not ready to receive traffic.
+        if flags & (0x08 | 0x40) == 0 {
+            addresses.insert(canonical_ip(IpAddr::V6(Ipv6Addr::from(address))));
+        }
+    }
+    addresses.retain(|address| !address.is_unspecified() && !address.is_multicast());
+    addresses
 }
 
 /// The socket tables are read before descriptors are scanned. A process that
@@ -799,10 +1070,14 @@ fn parse_diag_datagram(
             2 => return Some(DiagOutcome::Rejected), // NLMSG_ERROR
             3 => return Some(DiagOutcome::Complete), // NLMSG_DONE
             20 => {
-                if let Some((key, only)) = parse_ipv6_mode(&messages[16..length], protocol)
-                    && wanted.contains(&key)
-                {
-                    modes.insert(key, only);
+                if let Some((mut key, only)) = parse_ipv6_mode(&messages[16..length], protocol) {
+                    // This diagnostic socket queries the host namespace only.
+                    // Raw parser keys are namespace-neutral until the request's
+                    // identity is applied; wanted never mixes namespaces.
+                    key.namespace = wanted.iter().next().map_or(0, |key| key.namespace);
+                    if wanted.contains(&key) {
+                        modes.insert(key, only);
+                    }
                 }
             }
             _ => {}
@@ -818,6 +1093,7 @@ fn parse_ipv6_mode(message: &[u8], protocol: Protocol) -> Option<(SocketKey, boo
         return None;
     }
     let key = SocketKey {
+        namespace: 0,
         protocol,
         inode: u32::from_ne_bytes(message[68..72].try_into().ok()?) as u64,
         local: SocketAddr::new(
@@ -876,11 +1152,18 @@ fn parse_address(value: &str, ipv6: bool) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn parse_socket(line: &str, protocol: Protocol, ipv6: bool, now: Instant) -> Option<Socket> {
+fn parse_socket(
+    line: &str,
+    protocol: Protocol,
+    ipv6: bool,
+    now: Instant,
+    namespace: u64,
+) -> Option<Socket> {
     let fields: Vec<_> = line.split_ascii_whitespace().collect();
     let state = u8::from_str_radix(fields.get(3)?, 16).ok()?;
     Some(Socket {
         key: SocketKey {
+            namespace,
             inode: fields.get(9)?.parse().ok()?,
             protocol,
             local: parse_address(fields.get(1)?, ipv6)?,
@@ -1043,6 +1326,7 @@ mod tests {
 
     fn key(local: &str, remote: &str, inode: u64) -> SocketKey {
         SocketKey {
+            namespace: namespace_id(std::process::id()).unwrap(),
             inode,
             protocol: Protocol::Tcp,
             local: local.parse().unwrap(),
@@ -1067,6 +1351,129 @@ mod tests {
             current,
             ipv6_only: None,
         }
+    }
+
+    #[test]
+    fn namespace_keys_isolate_identical_endpoints_and_wildcards() {
+        let host = namespace_id(std::process::id()).unwrap();
+        let foreign = host + 1;
+        let local = "192.0.2.1:8080".parse().unwrap();
+        let remote = "198.51.100.2:40000".parse().unwrap();
+        for wildcard in [false, true] {
+            let host_key = if wildcard {
+                key("0.0.0.0:8080", "0.0.0.0:0", 10)
+            } else {
+                key("192.0.2.1:8080", "198.51.100.2:40000", 10)
+            };
+            let mut foreign_key = host_key.clone();
+            foreign_key.namespace = foreign;
+            foreign_key.inode = 11;
+            let inventory = inventory_with(vec![
+                owned_socket(host_key, 100, true),
+                owned_socket(foreign_key, 200, true),
+            ]);
+            assert_eq!(
+                resolved_pid(inventory.resolve(Protocol::Tcp, local, remote)),
+                Some(100)
+            );
+            assert_eq!(
+                resolved_pid(inventory.resolve_in(foreign, Protocol::Tcp, local, remote)),
+                Some(200)
+            );
+            assert!(matches!(
+                inventory.resolve_in(foreign + 1, Protocol::Tcp, local, remote),
+                Resolution::Missing
+            ));
+        }
+    }
+
+    #[test]
+    fn host_diagnostics_never_populate_foreign_ipv6_modes() {
+        let mut inventory = Inventory::new();
+        let mut socket_key = key("[::]:8080", "[::]:0", 12);
+        socket_key.namespace = inventory.host_namespace() + 1;
+        inventory.ipv6_modes.insert(socket_key.clone(), false);
+        let foreign = owned_socket(socket_key, 200, true);
+        inventory.refresh_ipv6_modes(&[foreign], Instant::now());
+        assert!(inventory.ipv6_modes.is_empty());
+        assert!(inventory.ipv6_attempts.is_empty());
+    }
+
+    #[test]
+    fn namespace_discovery_is_opt_in_and_disabling_removes_foreign_sockets() {
+        let mut inventory = Inventory::new();
+        let host = inventory.host_namespace();
+        assert!(!inventory.namespace_discovery);
+        assert_eq!(inventory.namespaces().len(), 1);
+        assert_eq!(inventory.namespaces()[&host].id, host);
+        inventory.set_namespace_discovery(true);
+        let mut foreign_key = key("192.0.2.1:8080", "198.51.100.2:40000", 13);
+        foreign_key.namespace = host + 1;
+        inventory.sockets.push(owned_socket(foreign_key, 200, true));
+        inventory.namespaces.insert(
+            host + 1,
+            Namespace {
+                id: host + 1,
+                representative_pid: 200,
+                addresses: HashSet::new(),
+            },
+        );
+        inventory.rebuild_index();
+        inventory.set_namespace_discovery(false);
+        assert!(inventory.sockets.is_empty());
+        assert!(inventory.exact.is_empty());
+        assert_eq!(inventory.namespaces().len(), 1);
+        assert!(inventory.last_scan.is_none());
+    }
+
+    #[test]
+    fn namespace_addresses_require_local_routes_and_ready_ipv6_addresses() {
+        let ipv4 = "Main:\n  |-- 192.0.2.0\n    /24 link UNICAST\n  |-- 192.0.2.7\n    /32 host LOCAL\n  |-- 192.0.2.255\n    /32 link BROADCAST\n  |-- 127.0.0.1\n    /32 host LOCAL\n  |-- 203.0.113.1\n    /32 universe UNICAST\n    /32 host LOCAL\n";
+        let ipv6 = "20010db8000000000000000000000007 02 40 00 80 eth0\n20010db8000000000000000000000008 02 40 00 40 eth0\n20010db8000000000000000000000009 02 40 00 08 eth0\n00000000000000000000000000000001 01 80 10 80 lo\nnot-an-address 01 80 10 80 lo\n";
+        assert_eq!(
+            namespace_addresses(ipv4, ipv6),
+            HashSet::from([
+                "192.0.2.7".parse().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+                "2001:db8::7".parse().unwrap(),
+                "::1".parse().unwrap(),
+            ])
+        );
+    }
+
+    #[test]
+    fn proc_reads_reject_truncated_files_and_exhausted_budget() {
+        // memfd supplies an owned deterministic input without temporary paths
+        // or changing any namespace/network configuration.
+        let raw = unsafe { libc::memfd_create(c"nettop-proc-bound".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let mut file = unsafe { fs::File::from_raw_fd(raw) };
+        use std::io::Write;
+        file.write_all(b"0123456789").unwrap();
+        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let mut restricted = false;
+        let mut limited = false;
+        let mut budget = 10;
+        assert_eq!(
+            read_proc_bounded(Path::new(&path), &mut budget, &mut restricted, &mut limited)
+                .as_deref(),
+            Some("0123456789")
+        );
+        assert_eq!(budget, 0);
+        assert!(!restricted && !limited);
+        assert!(
+            read_proc_bounded(Path::new(&path), &mut budget, &mut restricted, &mut limited)
+                .is_none()
+        );
+        assert!(limited);
+        budget = 9;
+        limited = false;
+        assert!(
+            read_proc_bounded(Path::new(&path), &mut budget, &mut restricted, &mut limited)
+                .is_none()
+        );
+        assert_eq!(budget, 0);
+        assert!(limited && !restricted);
     }
 
     #[test]
@@ -1223,7 +1630,10 @@ mod tests {
         }
         let inventory = inventory_with(sockets);
         // Only the listener needs a per-port scan; connections are looked up directly.
-        assert_eq!(inventory.by_port[&(Protocol::Tcp, 443)].len(), 1);
+        assert_eq!(
+            inventory.by_port[&(inventory.host_namespace(), Protocol::Tcp, 443)].len(),
+            1
+        );
         let local = "192.0.2.1:443".parse().unwrap();
         assert_eq!(
             resolved_pid(inventory.resolve(
@@ -1548,6 +1958,7 @@ mod tests {
         socket[72..74].copy_from_slice(&5_u16.to_ne_bytes());
         socket[74..76].copy_from_slice(&11_u16.to_ne_bytes());
         let wanted = HashSet::from([SocketKey {
+            namespace: 0,
             inode: 123,
             protocol: Protocol::Udp,
             local: "[::]:53000".parse().unwrap(),

@@ -118,6 +118,60 @@ by removing `/usr/local/libexec/nettop-collector` and its receipt,
 
 </details>
 
+### Optional extended attribution
+
+For sockets that live less than one scan interval and container published ports,
+opt in to socket lifecycle events, network namespace discovery and conntrack NAT
+translation. The default build and its permissions are unchanged.
+
+```bash
+# Additional build/runtime dependencies on Ubuntu 24.04+.
+sudo apt install clang libbpf-dev
+./scripts/install.sh --extended-attribution
+./scripts/setup-capture.sh --extended-attribution
+```
+
+This requires Linux with BTF and supported BPF tracing hooks, a little-endian
+x86_64 or aarch64 target, and `libbpf.so.1`. The kernel integration tests use
+Linux 6.8 on x86_64; other kernel configurations can reject the hooks. Missing
+support, permissions, event losses and stale conntrack data are reported in
+capture status instead of silently guessing ownership. F1 shows the active mode.
+If neither optional backend can start, standard sampled attribution remains
+available alongside the startup errors.
+
+The extended helper additionally receives `CAP_BPF`, `CAP_PERFMON` and
+`CAP_NET_ADMIN`. Its BPF worker drops all capabilities after attaching; its
+conntrack worker retains only `CAP_NET_ADMIN` for subsequent netlink queries.
+The UI stays unprivileged. No permanent service or pinned BPF objects are created;
+closing nettop releases its probes. Run both installer scripts again without
+`--extended-attribution` to return to the standard build and capability set.
+
+Captured IP packets remain the only source of process byte counts. Event data
+contains socket/process identities and endpoints, never payloads. Attribution
+can be delayed by up to two seconds while late events arrive. Ambiguous owners,
+shared descriptors, event loss and unsupported asynchronous I/O may still leave
+traffic unattributed. This is monitoring, not complete per-process accounting.
+
+**Conntrack must actually track the flows** for sampled socket evidence to
+supplement events. Merely loading its module or opening netlink does not enable
+tracking. With untracked/NOTRACK traffic, queued receive data on long-lived
+sockets, and packets sent after their syscall window, can remain unattributed
+even when the process is visible; capture status
+reports missing confirmed conntrack entries. nettop does not change firewall
+rules to enable tracking. The standard build's sampled mode remains available.
+Further work is tracked in [#8](https://github.com/itmitalles-de/nettop/issues/8).
+
+The extended mode discovers accessible network namespaces without entering them.
+Conntrack translates published-port DNAT and SNAT endpoints; conflicting NAT
+zones remain unattributed. In All, container traffic is counted at the host veth
+boundary once per process direction. Container-internal loopback traffic is not
+visible to host capture, and macvlan/ipvlan paths without that boundary are not
+included in All process totals. A selected visible interface can still show
+attribution. Namespace discovery, queues and event history are bounded.
+Additional namespace capture paths are tracked in
+[#9](https://github.com/itmitalles-de/nettop/issues/9), and further live kernel
+coverage in [#10](https://github.com/itmitalles-de/nettop/issues/10).
+
 ## Use
 
 ```bash
@@ -219,9 +273,10 @@ data. Interface totals and process totals can differ.
   Process rates there count host traffic once: copies seen on bridge ports, bond
   slaves or VLAN parents are left out, but still shown when that link is
   selected. Forwarded traffic can repeat in the unattributed row.
-- Attribution covers accessible sockets in the host network namespace. Processes
-  in separate container network namespaces are not fully attributed.
-- Socket ownership is sampled. Short-lived, shared, and ambiguously reused
+- Standard attribution covers accessible sockets in the host network namespace.
+  The optional extended mode also correlates accessible container namespaces and
+  conntrack NAT; its capture boundaries are described above.
+- Standard socket ownership is sampled. Short-lived, shared, and ambiguously reused
   sockets can remain in the unattributed bucket; per-PID rates are not a complete
   accounting ledger. Equally matching `SO_REUSEPORT` sockets of one process
   credit that process, without a single connection row.

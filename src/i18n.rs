@@ -138,6 +138,8 @@ impl Lang {
                     "ALLE Schnittstellen: weitergeleitete Bridge/veth-Pakete können sich wiederholen; Prozessraten zählen mitgeschnittene IP-Bytes",
                 )
                 .into(),
+            CaptureNote::Extended => self.pick("Process rates: captured IP bytes; socket events with sampled fallback", "Prozessraten: mitgeschnittene IP-Bytes; Socket-Ereignisse mit Abtast-Fallback").into(),
+            CaptureNote::ExtendedIssue { detail } => format!("{}: {detail}",self.pick("Extended attribution", "Erweiterte Zuordnung")),
             CaptureNote::Sampled => self
                 .pick(
                     "Process rates: captured IP bytes; socket/PID owners sampled, brief sockets may be unattributed",
@@ -209,7 +211,9 @@ impl Lang {
             status
                 .notes
                 .iter()
-                .filter(|note| routine || **note != CaptureNote::Sampled)
+                .filter(|note| {
+                    routine || !matches!(note, CaptureNote::Sampled | CaptureNote::Extended)
+                })
                 .map(|note| self.capture_note(note))
                 .collect::<Vec<_>>()
                 .join("; "),
