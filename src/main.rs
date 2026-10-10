@@ -213,21 +213,16 @@ fn main() -> Result<()> {
         Some(name) => Some(name.to_string()),
         None => automatic_interface.clone(),
     };
-    let mut first = match source.sample(interface.as_deref(), &shutdown) {
-        Ok(snapshot) => snapshot,
-        Err(_) if shutdown.requested() => return Ok(()),
-        Err(error) if source.is_helper() => {
-            helper_error = Some(error);
-            source = Source::Live(Box::new(Collector::new(true)?));
-            source.sample(interface.as_deref(), &shutdown)?
-        }
-        Err(error) => return Err(error),
+    let Some(mut first) = startup_sample(
+        &mut source,
+        interface.as_deref(),
+        &shutdown,
+        &mut helper_error,
+        direct_collector,
+    )?
+    else {
+        return Ok(());
     };
-    if !first.capture.active
-        && let Some(error) = helper_error
-    {
-        eprintln!("Capture setup: {error:#}. Run scripts/setup-capture.sh once; see README.");
-    }
     if let Some(name) = &interface
         && !first.interfaces.iter().any(|iface| &iface.name == name)
     {
@@ -248,7 +243,22 @@ fn main() -> Result<()> {
         // Only this run falls back; F12 keeps the saved choice unless changed.
         settings.interface = None;
         interface = automatic_interface.clone();
-        first = source.sample(interface.as_deref(), &shutdown)?;
+        let Some(retry) = startup_sample(
+            &mut source,
+            interface.as_deref(),
+            &shutdown,
+            &mut helper_error,
+            direct_collector,
+        )?
+        else {
+            return Ok(());
+        };
+        first = retry;
+    }
+    if !first.capture.active
+        && let Some(error) = helper_error
+    {
+        eprintln!("Capture setup: {error:#}. Run scripts/setup-capture.sh once; see README.");
     }
     if args.once || args.json {
         let deadline = Instant::now() + Duration::from_millis(settings.interval_ms);
@@ -336,6 +346,30 @@ fn main() -> Result<()> {
         let _ = writeln!(io::stderr(), "Failed to restore terminal: {error}");
     }
     result
+}
+
+/// A startup sample. A failed helper is replaced by `fallback` and its error
+/// kept for the setup hint; `None` means shutdown was requested meanwhile.
+fn startup_sample(
+    source: &mut Source,
+    interface: Option<&str>,
+    shutdown: &SignalGuard,
+    helper_error: &mut Option<anyhow::Error>,
+    fallback: impl FnOnce() -> Result<Source>,
+) -> Result<Option<Snapshot>> {
+    match source.sample(interface, shutdown) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(_) if shutdown.requested() => Ok(None),
+        Err(error) if source.is_helper() => {
+            *helper_error = Some(error);
+            *source = fallback()?;
+            match source.sample(interface, shutdown) {
+                Err(_) if shutdown.requested() => Ok(None),
+                result => result.map(Some),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A reader that exits early, as in `nettop --json | head`, is not an error.
@@ -454,7 +488,7 @@ fn save_settings(app: &mut App, config: Option<&ConfigFile>) {
     let lang = app.lang();
     let settings = app.settings_to_save();
     match config
-        .context("settings path unavailable")
+        .context(lang.settings_path_unavailable())
         .and_then(|config| config.save(&settings).map(|()| config.path()))
     {
         Ok(path) => app.settings_saved(lang.saved(&path.display().to_string())),
@@ -631,5 +665,38 @@ mod tests {
         let mut source = Source::Failing { helper: true };
         refresh(&mut source, &mut app, &shutdown, || bail!("no counters"));
         assert!(app.notice.as_deref().unwrap().contains("no counters"));
+    }
+
+    #[test]
+    fn every_startup_sample_falls_back_from_a_failed_helper() {
+        let shutdown = SignalGuard::new().unwrap();
+        let mut helper_error = None;
+        let mut source = Source::Failing { helper: true };
+        let snapshot = startup_sample(
+            &mut source,
+            Some("enp112s0"),
+            &shutdown,
+            &mut helper_error,
+            || {
+                Ok(Source::Demo {
+                    tick: 0,
+                    start: Instant::now(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(snapshot.is_some());
+        assert!(matches!(source, Source::Demo { .. }));
+        assert!(helper_error.is_some());
+        // Direct collection errors are still reported, not replaced.
+        let mut source = Source::Failing { helper: false };
+        let mut helper_error = None;
+        assert!(
+            startup_sample(&mut source, None, &shutdown, &mut helper_error, || {
+                panic!("only a failed helper may be replaced")
+            })
+            .is_err()
+        );
+        assert!(helper_error.is_none());
     }
 }

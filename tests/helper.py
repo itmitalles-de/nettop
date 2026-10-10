@@ -409,12 +409,18 @@ def check_abrupt_exit(binary, account):
 
 def check_installer(script, build, account):
     digest = hashlib.sha256(build.read_bytes()).hexdigest()
-    command = ["bash", str(script), "--install", str(build), str(account.pw_uid), str(account.pw_gid), digest]
 
-    def install(success):
-        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
-        assert (result.returncode == 0) == success, f"Unexpected installer result: {result.stdout}{result.stderr}"
+    def install(success, target=account, shared="1", reassign="0", expect=""):
+        # nobody's primary group nogroup is not a user private group.
+        command = ["bash", str(script), "--install", str(build), str(target.pw_uid),
+                   str(target.pw_gid), digest, shared, reassign]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+        output = result.stdout + result.stderr
+        assert (result.returncode == 0) == success, f"Unexpected installer result: {output}"
+        assert expect in output, f"Installer did not explain {expect!r}: {output}"
 
+    install(False, shared="0", expect="not the private group")
+    assert not os.path.lexists(HELPER), "A refused shared group still installed the helper"
     install(True)
     installed = HELPER.stat()
     assert installed.st_uid == 0 and installed.st_gid == account.pw_gid
@@ -452,7 +458,40 @@ def check_installer(script, build, account):
         HELPER.unlink()
         RECEIPT.unlink()
         install(True)
-    print("PASS installer: root ownership/capabilities, clean update and changed/untracked/symlink refusal")
+    check_installer_groups(install, build, account)
+    print("PASS installer: root ownership/capabilities, clean update, changed/untracked/symlink "
+          "refusal, shared and reassigned groups")
+
+
+def check_installer_groups(install, build, account):
+    """Shared primary groups and silent group takeover need explicit flags."""
+    private, other, listed = "nettop-test-private", "nettop-test-other", "nettop-test-listed"
+    nologin = ["--no-create-home", "--shell", "/usr/sbin/nologin"]
+    subprocess.run(["useradd", "--user-group", *nologin, private], check=True)
+    try:
+        owner = pwd.getpwnam(private)
+        os.chown(build, owner.pw_uid, owner.pw_gid)
+        # Another group already has access: moving it needs --reassign-group.
+        install(False, owner, shared="0", expect="--reassign-group")
+        assert HELPER.stat().st_gid == account.pw_gid
+        install(True, owner, shared="0", reassign="1")
+        assert HELPER.stat().st_gid == owner.pw_gid
+        install(True, owner, shared="0")
+        # A second account with the same primary group, or a listed member.
+        subprocess.run(["useradd", "--gid", private, *nologin, other], check=True)
+        install(False, owner, shared="0", expect=f"account {other} also has primary group")
+        install(True, owner, shared="1")
+        subprocess.run(["userdel", other], check=True)
+        subprocess.run(["useradd", "--user-group", *nologin, listed], check=True)
+        subprocess.run(["gpasswd", "--add", listed, private], check=True, stdout=subprocess.DEVNULL)
+        install(False, owner, shared="0", expect=f"also lists {listed}")
+    finally:
+        for name in (other, listed):
+            subprocess.run(["userdel", name], check=False, stderr=subprocess.DEVNULL)
+        os.chown(build, account.pw_uid, account.pw_gid)
+        install(True, reassign="1")
+        subprocess.run(["userdel", private], check=False, stderr=subprocess.DEVNULL)
+    assert HELPER.stat().st_gid == account.pw_gid
 
 
 def main():

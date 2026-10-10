@@ -50,8 +50,58 @@ pub struct ConnectionRow {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CaptureStatus {
     pub active: bool,
+    /// English text of `notes`, kept for `--once`, JSON consumers and older UIs.
     pub message: String,
     pub dropped: u64,
+    /// The same status in structured form, translated by the UI. Helpers
+    /// installed before this field existed omit it; the UI then shows `message`.
+    #[serde(default)]
+    pub notes: Vec<CaptureNote>,
+}
+
+/// One part of the capture status line. Older UIs ignore this field, and a
+/// newer helper's unknown code decodes as `Unknown`, so neither direction
+/// needs a protocol version change.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum CaptureNote {
+    /// `--no-capture`.
+    Disabled,
+    LibpcapMissing,
+    /// Capture permissions are missing; `detail` is libpcap's text.
+    SetupNeeded {
+        detail: String,
+    },
+    Unavailable {
+        detail: String,
+    },
+    NoInterfaceIndexes,
+    AllInterfaces,
+    /// The routine explanation; the UI keeps it in F1 Help only.
+    Sampled,
+    PcapMissed {
+        packets: u64,
+    },
+    FlowLimit {
+        packets: u64,
+    },
+    Unreadable {
+        unsupported: u64,
+        truncated: u64,
+    },
+    AttributionAtRefresh {
+        error: String,
+    },
+    Stopped {
+        error: String,
+    },
+    OwnersInaccessible,
+    CounterLimit,
+    InterfaceMissing {
+        name: String,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

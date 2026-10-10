@@ -84,14 +84,24 @@ symlinks, and modified executables are preserved.
 administrator authentication through `pkexec`, or `sudo` when `pkexec` is not
 installed, only for installing `/usr/local/libexec/nettop-collector`. Start both
 scripts without sudo. The package installation command above is separate from
-this user-local build.
+this user-local build. **The administrator who authenticates trusts your
+checkout:** the root phase runs this user-writable script and installs the binary
+you built. It copies that build once into a root-only file without following a
+symlink, verifies the digest of exactly that copy, and only then grants group
+access and capabilities.
 
 Run the UI installer again to update the UI. Repeat capture setup when updating
 the helper; the UI installer never replaces the installed privileged helper.
 
 The helper is owned by root, mode `0750`, and executable only by root and your
 primary group. **Members of that group can monitor system-wide network
-metadata.** Its file capabilities are `CAP_NET_RAW`, `CAP_DAC_READ_SEARCH`, and
+metadata.** Setup therefore refuses a primary group that is not your user private
+group (named like your account), lists other members, or is the primary group of
+another account, as with openSUSE's `users` or a directory's `domain users`. If
+every member is trusted, rerun with `--allow-shared-group`. Only one group can
+have access: when another group already has it, setup refuses to silently take
+it over; `--reassign-group` moves access to your group and revokes the other.
+Its file capabilities are `CAP_NET_RAW`, `CAP_DAC_READ_SEARCH`, and
 `CAP_SYS_PTRACE`. After opening the capture socket, the capture thread drops all
 capabilities; the sampling thread retains only the two needed to read
 `/proc/PID/fd`. Both prevent gaining new privileges. Core dumps are disabled.
@@ -206,11 +216,15 @@ data. Interface totals and process totals can differ.
   counters; process totals contain observed captured IP bytes.
 - Aggregating interfaces can count traffic more than once, for example across a
   bridge and its member interfaces. `--interface all` includes virtual links.
+  Process rates there count host traffic once: copies seen on bridge ports, bond
+  slaves or VLAN parents are left out, but still shown when that link is
+  selected. Forwarded traffic can repeat in the unattributed row.
 - Attribution covers accessible sockets in the host network namespace. Processes
   in separate container network namespaces are not fully attributed.
 - Socket ownership is sampled. Short-lived, shared, and ambiguously reused
   sockets can remain in the unattributed bucket; per-PID rates are not a complete
-  accounting ledger.
+  accounting ledger. Equally matching `SO_REUSEPORT` sockets of one process
+  credit that process, without a single connection row.
 - Forwarded traffic is not assigned to unrelated host listeners. Multicast and
   broadcast receiver membership is not inferred from ports. IPv6 wildcard
   sockets are matched to IPv4 only when Linux socket diagnostics confirm

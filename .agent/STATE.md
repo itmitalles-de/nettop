@@ -42,6 +42,20 @@
   and deaf to SIGHUP. `tests/terminal.py` now checks a closed terminal without
   SIGHUP, SIGHUP after closing and a closed controlling terminal (exit 0 within
   2 s); `tests/helper.py` checks that the helper is reaped in both hang-up cases.
+- Review round 2 (branch `fix/review-round-2`, 2026-10-10, uncommitted at
+  handoff): likely root cause of issue #6 fixed (SOCK_DIAG deadline started before
+  sendto(), which can autoload diag modules, plus a 2 s backoff after a timed-out
+  dump and no deferral while V6ONLY was unknown). Also: drain before socket
+  refresh and one-time deferral of local flows without a candidate, defer window
+  derived from the owner-scan gap, SO_REUSEPORT ties credit their process,
+  lower-device duplicates skipped in all-interface process rows, per-pass address
+  sets, startup helper fallback for the second sample, translated collector status
+  (structured `notes`, protocol v1 kept; mixed old/new UI and helper pass
+  `tests/helper.py`), setup refuses shared groups/silent group takeover
+  (`--allow-shared-group`, `--reassign-group`) and verifies a root-only copy.
+  `tests/live_capture.py` adds sockets opened after monitor start; 10/10 runs
+  passed locally (diag modules were already loaded on that host, so the autoload
+  timing itself was not reproduced).
 - Real separate-PID TCP/UDP capture tests passed for IPv4 and IPv6 in an isolated
   Ubuntu 26.04 Docker container, including IPv4 to a dual-stack UDP listener; no
   loopback double counting. CI uses Ubuntu 24.04. See `tests/live_capture.py`.

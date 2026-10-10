@@ -1178,15 +1178,18 @@ fn status_line(app: &App) -> Option<(String, Color)> {
     if app.demo {
         return None; // The device header already identifies synthetic data.
     }
-    if !app.snapshot.capture.active {
-        let message = if app.snapshot.capture.message.is_empty() {
+    let capture = &app.snapshot.capture;
+    if !capture.active {
+        let message = if let Some(message) = lang.capture_status(capture, true) {
+            message
+        } else if capture.message.is_empty() {
             lang.pick(
                 "Interface mode | enable process rates with scripts/setup-capture.sh",
                 "Schnittstellenmodus | Prozessraten mit scripts/setup-capture.sh aktivieren",
             )
             .into()
         } else {
-            app.snapshot.capture.message.clone()
+            capture.message.clone()
         };
         return Some((message, TX));
     }
@@ -1205,8 +1208,12 @@ fn status_line(app: &App) -> Option<(String, Color)> {
             TX,
         ));
     }
-    // Existing helpers combine a routine explanation with runtime warnings.
-    // Keep the explanation in F1 Help and preserve any appended warning.
+    // The routine explanation stays in F1 Help; runtime warnings are shown.
+    if let Some(message) = lang.capture_status(capture, false) {
+        return (!message.is_empty()).then_some((message, TX));
+    }
+    // Helpers without structured notes send one English text; strip the
+    // explanation and preserve any appended warning.
     let message = app.snapshot.capture.message.strip_prefix(
         "Process rates: captured IP bytes; socket/PID owners sampled, brief sockets may be unattributed"
     ).unwrap_or(&app.snapshot.capture.message).trim_start_matches("; ");
@@ -1833,7 +1840,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Interface totals are kernel counters since boot.",
             "Process totals are observed IP bytes this session.",
             "Shared, short-lived or inaccessible sockets can be unattributed.",
-            "Virtual links can count the same traffic more than once in all mode.",
+            "In all mode, virtual links can count forwarded traffic more than once.",
             "Command-line options and NO_COLOR apply only to this run.",
             "Enable process rates once: ./scripts/setup-capture.sh",
             "After setup, start nettop without sudo.",
@@ -1859,7 +1866,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "Schnittstellensummen sind Kernel-Zähler seit dem Systemstart.",
             "Prozesssummen sind in dieser Sitzung beobachtete IP-Bytes.",
             "Geteilte, kurzlebige oder unzugängliche Sockets bleiben evtl. unzugeordnet.",
-            "Virtuelle Links können im Modus Alle denselben Verkehr mehrfach zählen.",
+            "Im Modus Alle können virtuelle Links Weitergeleitetes mehrfach zählen.",
             "Kommandozeilenoptionen und NO_COLOR gelten nur für diesen Lauf.",
             "Prozessraten einmalig aktivieren: ./scripts/setup-capture.sh",
             "Danach nettop ohne sudo starten.",
@@ -1867,7 +1874,10 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
     };
     let mut text: Vec<Line<'_>> = lines.iter().map(|line| Line::from(*line)).collect();
-    text.push(Line::from(app.snapshot.capture.message.as_str()));
+    text.push(Line::from(
+        lang.capture_status(&app.snapshot.capture, true)
+            .unwrap_or_else(|| app.snapshot.capture.message.clone()),
+    ));
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -2015,6 +2025,7 @@ pub fn demo_snapshot(tick: u64, elapsed: f64) -> Snapshot {
             active: true,
             message: "DEMO data".into(),
             dropped: 0,
+            notes: Vec::new(),
         },
     }
 }
@@ -2324,6 +2335,34 @@ mod tests {
         assert_eq!(app.settings.sort, Sort::Receive);
         assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.handle_key(KeyCode::F(10).into()), Action::Quit);
+    }
+
+    #[test]
+    fn collector_status_follows_the_ui_language() {
+        use crate::model::CaptureNote;
+        let mut app = app();
+        app.demo = false;
+        app.settings.language = crate::config::Language::De;
+        app.snapshot.capture.message = "English text from the collector".into();
+        app.snapshot.capture.notes = vec![CaptureNote::Sampled, CaptureNote::OwnersInaccessible];
+        let (line, _) = status_line(&app).unwrap();
+        assert_eq!(line, "einige /proc-Besitzer unzugänglich");
+        app.snapshot.capture.notes = vec![CaptureNote::Sampled];
+        assert!(status_line(&app).is_none(), "the routine note stays in F1");
+        app.snapshot.capture.active = false;
+        app.snapshot.capture.notes = vec![CaptureNote::InterfaceMissing {
+            name: "eth9".into(),
+        }];
+        assert_eq!(
+            status_line(&app).unwrap().0,
+            "F2: Schnittstelle wählen; eth9 ist nicht verfügbar"
+        );
+        // An older helper without notes: its text is shown as sent.
+        app.snapshot.capture.notes.clear();
+        assert_eq!(
+            status_line(&app).unwrap().0,
+            "English text from the collector"
+        );
     }
 
     #[test]

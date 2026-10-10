@@ -3,6 +3,7 @@
 
 Run as root with libpcap installed. The sender and receiver are separate PIDs;
 both keep their sockets alive until the monitor has completed its sample.
+Late cases create both sockets only after the monitor has started.
 Only loopback, ephemeral ports, and processes owned by this test are used.
 """
 
@@ -40,12 +41,23 @@ def receiver(family, kind, control, finished, expected, dual_stack=False):
                 connection.close()
 
 
-def run_case(binary, family, kind, dual_stack=False):
+def start_monitor(binary, interval):
+    return subprocess.Popen(
+        [str(binary), "--interface", "lo", "--json", "--interval", str(interval)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def run_case(binary, family, kind, dual_stack=False, late=False):
     label = ("IPv4" if family == socket.AF_INET else "IPv6") + " " + (
         "TCP" if kind == socket.SOCK_STREAM else "UDP"
     )
     if dual_stack:
         label += " to dual-stack IPv6 wildcard"
+    if late:
+        label += ", sockets opened after monitor start"
     payload = b"n" * 1024
     packets = 128
     expected = len(payload) * packets
@@ -56,9 +68,13 @@ def run_case(binary, family, kind, dual_stack=False):
         target=receiver,
         args=(receiver_family, kind, child, finished, expected, dual_stack),
     )
+    monitor = None
+    if late:
+        # The initial inventory and first attribution passes see neither socket.
+        monitor = start_monitor(binary, 2.5)
+        time.sleep(0.5)
     server.start()
     child.close()
-    monitor = None
     try:
         assert parent.poll(5), f"{label}: receiver did not bind"
         port = parent.recv()
@@ -66,14 +82,10 @@ def run_case(binary, family, kind, dual_stack=False):
         with socket.socket(family, kind) as sender:
             sender.connect((address, port))
             assert parent.poll(5) and parent.recv() == "ready", f"{label}: receiver not ready"
-            monitor = subprocess.Popen(
-                [str(binary), "--interface", "lo", "--json", "--interval", "1.5"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            # Allow startup and the initial socket inventory to complete.
-            time.sleep(0.35)
+            if monitor is None:
+                monitor = start_monitor(binary, 1.5)
+                # Allow startup and the initial socket inventory to complete.
+                time.sleep(0.35)
             for _ in range(packets):
                 if kind == socket.SOCK_STREAM:
                     sender.sendall(payload)
@@ -126,6 +138,9 @@ def main():
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             run_case(binary, family, kind)
     run_case(binary, socket.AF_INET, socket.SOCK_DGRAM, dual_stack=True)
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        run_case(binary, socket.AF_INET, kind, late=True)
+    run_case(binary, socket.AF_INET, socket.SOCK_DGRAM, dual_stack=True, late=True)
     print("All live capture checks passed.")
 
 

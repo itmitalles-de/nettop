@@ -1,6 +1,7 @@
 //! An owned, non-promiscuous libpcap session with bounded in-memory aggregation.
 
 use super::packet::{self, Direction, Flow, Fragment, FragmentKey, Packet, Protocol};
+use crate::model::CaptureNote;
 use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 use std::collections::HashMap;
@@ -15,6 +16,18 @@ const MAX_FLOWS: usize = 16_384;
 const MAX_INTERFACES: usize = 256;
 const MAX_FRAGMENTED_DATAGRAMS: usize = 4_096;
 const FRAGMENT_LIFETIME: Duration = Duration::from_secs(2);
+
+/// A capture start failure the UI can explain in its own language.
+#[derive(Debug)]
+pub(super) struct StartError(pub CaptureNote);
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::i18n::Lang::En.capture_note(&self.0))
+    }
+}
+
+impl std::error::Error for StartError {}
 
 #[repr(C)]
 struct PcapHeader {
@@ -62,8 +75,7 @@ impl Api {
                 break;
             }
         }
-        let library =
-            library.context("Install libpcap runtime (libpcap0.8); process rates unavailable")?;
+        let library = library.ok_or(StartError(CaptureNote::LibpcapMissing))?;
         unsafe {
             Ok(Self {
                 create: *library.get(b"pcap_create\0")?,
@@ -114,9 +126,10 @@ impl Session {
         let handle = unsafe { (api.create)(device.as_ptr(), error_buffer.as_mut_ptr()) };
         if handle.is_null() {
             let message = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
-            bail!(
-                "Process capture needs one-time setup (see README); capture unavailable: {message}"
-            );
+            return Err(StartError(CaptureNote::SetupNeeded {
+                detail: message.into_owned(),
+            })
+            .into());
         }
         // A session owns the handle even if a configuration step fails.
         let mut session = Self {
@@ -140,16 +153,13 @@ impl Session {
             }
             let activated = (session.api.activate)(handle);
             if activated < 0 {
-                if activated == -8 || activated == -11 {
-                    bail!(
-                        "Process capture needs one-time setup (see README); {}",
-                        session.api.message(handle)
-                    );
-                }
-                bail!(
-                    "Process capture unavailable: {}",
-                    session.api.message(handle)
-                );
+                let detail = session.api.message(handle);
+                return Err(StartError(if activated == -8 || activated == -11 {
+                    CaptureNote::SetupNeeded { detail }
+                } else {
+                    CaptureNote::Unavailable { detail }
+                })
+                .into());
             }
             // SLL2 tags every frame with its interface, so interface selection
             // never relies on guessing from addresses or socket queue sizes.
@@ -282,7 +292,7 @@ impl Capture {
                 let session = match Session::open() {
                     Ok(session) => session,
                     Err(error) => {
-                        let _ = sender.send(Err(error.to_string()));
+                        let _ = sender.send(Err(error));
                         return;
                     }
                 };
@@ -290,9 +300,7 @@ impl Capture {
                 // descriptor, but remove the worker's inherited privileges before
                 // publishing readiness or processing any packets.
                 if let Err(error) = crate::privilege::drop_capture_privileges() {
-                    let _ = sender.send(Err(format!(
-                        "dropping packet capture privileges: {error:#}"
-                    )));
+                    let _ = sender.send(Err(error.context("dropping packet capture privileges")));
                     return;
                 }
                 if sender.send(Ok(session.datalink == 276)).is_err() {
@@ -381,9 +389,9 @@ impl Capture {
                 worker: Some(worker),
                 interface_indexes,
             }),
-            Ok(Err(message)) => {
+            Ok(Err(error)) => {
                 let _ = worker.join();
-                Err(anyhow!(message))
+                Err(error)
             }
             Err(error) => {
                 stop.store(true, Ordering::Relaxed);
