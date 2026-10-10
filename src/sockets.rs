@@ -1773,13 +1773,15 @@ mod tests {
         let Ok(listener) = std::net::TcpListener::bind("[::]:0") else {
             return; // No IPv6 in this environment.
         };
-        let port = listener.local_addr().unwrap().port();
+        let local = listener.local_addr().unwrap();
         let mut inventory = Inventory::new();
         inventory.refresh();
         let key = inventory
             .sockets
             .iter()
-            .find(|socket| socket.current && socket.key.local.port() == port)
+            .find(|socket| {
+                socket.current && socket.key.protocol == Protocol::Tcp && socket.key.local == local
+            })
             .map(|socket| socket.key.clone())
             .unwrap();
         let Some(&mode) = inventory.ipv6_modes.get(&key) else {
@@ -1788,7 +1790,8 @@ mod tests {
         inventory.last_scan = None;
         inventory.refresh();
         assert_eq!(inventory.ipv6_modes.get(&key), Some(&mode));
-        assert!(inventory.ipv6_attempts.is_empty());
+        // Other live system sockets may still require diagnostic retries.
+        assert!(!inventory.ipv6_attempts.contains_key(&key));
         drop(listener);
         inventory.last_scan = None;
         inventory.refresh();

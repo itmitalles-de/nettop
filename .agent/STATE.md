@@ -2,7 +2,8 @@
 
 ## Optional attribution implementation (2026-10-10)
 
-- Work branch `fix/attribution-limits`, based on `0de3644`.
+- Implementation merged as [PR #11](https://github.com/itmitalles-de/nettop/pull/11)
+  (`cbb33c5`, implementation `98ccdb5`), closing #2.
 - Opt-in `ebpf` build adds socket lifecycle events, namespace inventories,
   conntrack translation/reuse quarantine, veth deduplication and visible degraded
   status. Both installer scripts accept `--extended-attribution`; standard
@@ -27,11 +28,30 @@
 - Remaining work: [#8](https://github.com/itmitalles-de/nettop/issues/8)
   untracked long-lived flows, [#9](https://github.com/itmitalles-de/nettop/issues/9)
   namespace capture boundaries, [#10](https://github.com/itmitalles-de/nettop/issues/10)
-  further adversarial/kernel runtime coverage. Missing conntrack mappings never
+  further adversarial/kernel runtime coverage, and
+  [#13](https://github.com/itmitalles-de/nettop/issues/13) bounded packet-queue
+  pressure under host load. Missing conntrack mappings never
   prove absence of NAT, and nettop does not change firewall rules.
-- Host build dependencies clang/libbpf-dev are installed. Local activation and
-  merged CI verification still follow this implementation; installed binaries
-  currently remain the completed baseline below.
+- Startup follow-up for #12 fixes libbpf callback yielding (negative return),
+  attaches exits before entries and arms metadata recording only after all
+  links are installed. Bounded loss diagnostics persist through quarantine;
+  pending-map deletion failures are checked. The system-dependent IPv6 cache
+  test now asserts only on its own socket.
+- Real kernel regressions prove both fixes: 5000 queued metadata events no
+  longer discard later events; deliberately incomplete attachment produces
+  nested-call losses unless recording remains disarmed until setup completes.
+  All six VM live cases and capability/cleanup checks passed on the final
+  build. Formatting, Clippy in both modes and 141 Rust tests (also 1.88.0)
+  passed. GitHub CI for the follow-up remains pending.
+- Extended UI and helper are installed on Linux 7.0 from this follow-up.
+  Twelve fresh host starts showed no socket-event loss or ownership quarantine,
+  known TX 3.85–4.05 MB/s and unknown TX 0–2.15 kB/s. Eleven samples had no
+  packet overflow; one reported 438 packets at the flow limit without event
+  loss or loss of normal attribution (#13). Do not report that all host checks
+  were overflow-free. The untracked-flow notice remains expected under #8.
+  UI has no capabilities; helper is root:tim 0750 with the extended set.
+  Verified SHA-256: UI `4ee579712ae9c9321ff6555f5a41e2aa482eb591fb534785de2e2443878f14ac`,
+  helper `9a66ba48a869e8ba32bcfa1d9ae084a7c8c4a3f3601d96a12366c50778d22162`.
 - Private evidence and the dedicated QEMU guest are outside Git under
   `../nettop-review/issue-2/`; use generated VM wrappers/current PID files,
   never stale ports. Retain evidence, stop the guest after validation, and keep
@@ -116,8 +136,8 @@
   Live `--once` attributed user and root processes; the sample had about
   6 KiB/s unattributed in each direction versus about 4 MiB/s total TX.
   Local fmt, Clippy with warnings denied and all 83 Rust tests passed; CI and
-  CodeQL passed on the merge commit. Remaining attribution work is tracked in
-  [issue #2](https://github.com/itmitalles-de/nettop/issues/2).
+  CodeQL passed on the merge commit. Issue #2 was subsequently implemented
+  by PR #11; current limits and follow-ups are recorded above.
 - The redesigned README shares the site's banner and explicit DEMO image.
   `site/` contains the responsive project website, terminal recording and local
   licensed fonts. Pages is configured as public with custom domain

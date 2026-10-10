@@ -13,7 +13,7 @@ libbpf.so.1, libpcap, Python 3 and iproute2. As guest root:
 python3 tests/extended.py --isolated-vm target/release/nettop
 ```
 
-`--case tcp4|tcp6|udp4|udp6|exited` selects an individual case. Every socket
+`--case tcp4|tcp6|udp4|udp6|exited|burst` selects an individual case. Every socket
 exchange finishes without deliberate delays, typically within a millisecond;
 the test rejects runs whose median socket lifetime is not below 25 ms. TCP
 accepts and both UDP endpoints are created after packet capture is ready and
@@ -32,6 +32,15 @@ Degraded-status notes fail the test except for the precise missing-conntrack
 notice on TCP: control packets after a proven ownership window may remain
 unknown. That exception requires positive unknown traffic bounded to 1024 bytes
 per socket and direction; all four payload attribution checks still apply.
+
+The `burst` case briefly stops its own monitor process after verifying its
+capture socket and BPF links. It binds and closes 2500 UDP sockets without
+sending packets, queuing at least 5000 metadata events while avoiding pcap and
+conntrack queue pressure. After resuming every monitor thread, a real datagram
+must be attributed exactly in both directions without degradation. This exceeds
+the libbpf callback's 2048-record batch limit while remaining below the kernel
+ring capacity, detecting a callback that discards the remaining records instead
+of yielding. Cleanup always resumes a stopped monitor before terminating it.
 
 Only loopback sockets, ephemeral ports, temporary configuration and child
 processes owned by the harness are created. Shutdown waits are bounded and

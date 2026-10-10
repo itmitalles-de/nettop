@@ -9,6 +9,7 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import signal
 import socket
 import statistics
 import subprocess
@@ -193,11 +194,81 @@ def run_case(binary, family, kind, exit_early=False):
         child.close()
 
 
+def run_burst(binary):
+    """Cross libbpf's callback batch limit without overflowing packet queues."""
+    count = 2500
+    payload = b"b" * 32
+    with tempfile.TemporaryDirectory(prefix="nettop-event-burst-") as config:
+        monitor = subprocess.Popen(
+            [str(binary), "--json", "--interface", "lo", "--interval", "5"],
+            env=dict(os.environ, XDG_CONFIG_HOME=config, LANG="C"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        stopped = False
+        try:
+            wait_capture(monitor)
+            # The root monitor owns its collector and BPF links in process.
+            # Stop every consumer while the attached kernel producers continue.
+            os.kill(monitor.pid, signal.SIGSTOP)
+            stopped = True
+            deadline = time.monotonic() + 2
+            states = []
+            while time.monotonic() < deadline:
+                states = [(task / "status").read_text().split("State:", 1)[1].splitlines()[0]
+                          for task in Path(f"/proc/{monitor.pid}/task").iterdir()]
+                if states and all("T" in state for state in states):
+                    break
+                time.sleep(0.001)
+            assert states and all("T" in state for state in states), states
+            started = time.monotonic()
+            # At least 5000 metadata records, exceeding the 2048-event callback
+            # batch but well below the 4 MiB ring. No pcap or conntrack traffic.
+            for _ in range(count):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+                    datagram.bind(("127.0.0.1", 0))
+            duration = time.monotonic() - started
+            os.kill(monitor.pid, signal.SIGCONT)
+            stopped = False
+            time.sleep(0.15)
+            with (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver,
+                  socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender):
+                receiver.bind(("127.0.0.1", 0))
+                receiver.settimeout(2)
+                assert sender.sendto(payload, receiver.getsockname()) == len(payload)
+                assert receiver.recvfrom(1024)[0] == payload
+            stdout, stderr = monitor.communicate(timeout=12)
+            assert monitor.returncode == 0, stderr
+            snapshot = json.loads(stdout)
+            rows = {row["pid"]: row for row in snapshot["processes"]}
+            own = rows.get(os.getpid(), {})
+            capture = snapshot["capture"]
+            expected = len(payload) + 28
+            print(json.dumps({"case": "metadata ring burst", "metadata_only_sockets": count,
+                              "minimum_queued_events": count * 2, "burst_seconds": duration,
+                              "expected_ip_bytes_each_direction": expected, "process": own,
+                              "unattributed": rows.get(None, {}), "capture": capture}), flush=True)
+            assert capture["active"] and capture["dropped"] == 0, capture
+            notes = capture.get("notes", [])
+            assert any(note.get("code") == "extended" for note in notes), capture
+            assert not any(note.get("code") == "extended_issue" for note in notes), capture
+            assert own.get("rx_bytes") == expected and own.get("tx_bytes") == expected, own
+        finally:
+            if monitor.poll() is None:
+                if stopped:
+                    os.kill(monitor.pid, signal.SIGCONT)
+                monitor.terminate()
+                try:
+                    monitor.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    monitor.kill()
+                    monitor.communicate()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--isolated-vm", action="store_true", required=True)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--case", choices=["all", "tcp4", "tcp6", "udp4", "udp6", "exited"], default="all")
+    parser.add_argument("--case", choices=["all", "tcp4", "tcp6", "udp4", "udp6", "exited", "burst"], default="all")
     args = parser.parse_args()
     assert os.geteuid() == 0, "run as root only inside the dedicated test VM"
     virtualization = subprocess.run(["systemd-detect-virt", "--vm"], capture_output=True, text=True)
@@ -215,6 +286,8 @@ def main():
             run_case(binary, family, kind)
     if args.case in {"all", "exited"}:
         run_case(binary, socket.AF_INET, socket.SOCK_DGRAM, exit_early=True)
+    if args.case in {"all", "burst"}:
+        run_burst(binary)
     print("PASS optional socket attribution", flush=True)
 
 
