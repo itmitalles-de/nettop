@@ -1,5 +1,23 @@
 # Verified state
 
+## Full review fixes (2026-10-10)
+
+- #18: first-fragment port evidence is scoped by interface and direction;
+  conflicting identities remain quarantined until the two-second expiry.
+- #19: peerless UDP read/recv retains exact socket-incarnation actor evidence
+  without creating an incomplete tuple match. Existing sharing, reuse, loss
+  and lifetime vetoes still apply.
+- #20: selected host interfaces exclude unrelated foreign-namespace socket
+  inventory; positively observed foreign connection counters remain visible.
+- Verified: 148 default and 157 extended Rust tests, formatting and Clippy in
+  both modes; real isolated TCP/UDP capture, capability helper, terminal and
+  Setup tests. A dedicated Linux 7.0 KVM guest passed four receive-only UDP
+  read/recv cases (IPv4/IPv6, 200 sockets each), with exact IP bytes, zero server
+  TX and no capture losses or degraded attribution. The guest was shut down.
+- Fix evidence is outside Git in
+  `../nettop-review/full-code-review-20261010/`; historical installation
+  hashes below describe earlier builds and must not identify the current one.
+
 ## Rename to nwtop (2026-10-10)
 
 - The project is now public `itmitalles-de/nwtop` (GPL-3.0-or-later).

@@ -13,14 +13,19 @@ libbpf.so.1, libpcap, Python 3 and iproute2. As guest root:
 python3 tests/extended.py --isolated-vm target/release/nwtop
 ```
 
-`--case tcp4|tcp6|udp4|udp6|exited|burst` selects an individual case. Every socket
-exchange finishes without deliberate delays, typically within a millisecond;
+`--case tcp4|tcp6|udp4|udp6|exited|peerless|burst` selects an individual case.
+Every socket exchange finishes without deliberate delays, typically within a millisecond;
 the test rejects runs whose median socket lifetime is not below 25 ms. TCP
 accepts and both UDP endpoints are created after packet capture is ready and
 close before the final five-second snapshot. Sender and receiver are separate
 processes. The UDP test uses unconnected sendto/recvfrom and rotates both sockets.
 A separate case exits and reaps the receiver before the snapshot, so even its
 `/proc/PID/stat` identity is gone.
+
+The `peerless` case checks IPv4 and IPv6 receive-only servers using `os.read(fd)`
+and `recv()` on 200 unconnected UDP sockets each. The servers never send a reply
+or expose a peer through another syscall. Actual IP byte totals must match
+exactly for sender TX and server RX, with zero server TX and no degraded status.
 
 The assertions require actual BPF links before sending, an active optional
 backend without capture drops, and attributed IP byte

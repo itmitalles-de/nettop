@@ -1184,4 +1184,96 @@ mod tests {
         assert!(index.limited && index.entries.is_empty());
         assert!(index.vetoes(&socket));
     }
+    #[test]
+    fn udp_read_without_peer_uses_packet_identity_and_exact_current_descriptor() {
+        let mut inventory = Inventory::new();
+        let ns = inventory.host_namespace();
+        let mut socket = listener(&inventory, 200);
+        socket.owners[0].identity = ProcessIdentity {
+            pid: 200,
+            start_time: unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64,
+        };
+        inventory.sockets.push(socket);
+        let recv = Event {
+            flags: 2,
+            remote_port: 0,
+            remote_addr: [0; 16],
+            ..actor(ns, 200, "127.0.0.1:8080", "127.0.0.1:40000", true)
+        };
+        let packet = PacketEvent {
+            timestamp_ns: 8_000_000,
+            socket_id: 200,
+            inode: 200,
+            netns: ns as u32,
+            ip_bytes: 1028,
+            family: libc::AF_INET as u16,
+            protocol: 17,
+            receive: 1,
+            flags: 1,
+            local_addr: recv.local_addr,
+            remote_addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            local_port: 8080,
+            remote_port: 40000,
+            ..PacketEvent::default()
+        };
+        let mut ext = extended();
+        ext.owners.update(vec![recv], 0, 30_000_000, &inventory);
+        ext.sampled_owners.refresh(&inventory);
+        let PacketResult::Owned(observed, known) = ext.resolve_packet(&packet, &inventory, true)
+        else {
+            panic!("actual socket packet and matching current reader must resolve");
+        };
+        assert!(known);
+        assert_eq!(observed.owner().unwrap().identity.pid, 200);
+        assert_eq!(observed.key.remote, "127.0.0.1:40000".parse().unwrap());
+        assert!(matches!(
+            ext.resolve_packet(
+                &PacketEvent {
+                    socket_id: 201,
+                    ..packet
+                },
+                &inventory,
+                true
+            ),
+            PacketResult::Unknown
+        ));
+        assert!(matches!(
+            ext.resolve_packet(
+                &PacketEvent {
+                    inode: 201,
+                    ..packet
+                },
+                &inventory,
+                true
+            ),
+            PacketResult::Unknown
+        ));
+        inventory.sockets[0].owners[0].identity.start_time += 1;
+        ext.sampled_owners.refresh(&inventory);
+        assert!(matches!(
+            ext.resolve_packet(&packet, &inventory, true),
+            PacketResult::Unknown
+        ));
+        inventory.sockets[0].owners[0].identity.start_time -= 1;
+        let mut second = inventory.sockets[0].owners[0].clone();
+        second.identity.pid += 1;
+        inventory.sockets[0].owners.push(second);
+        ext.sampled_owners.refresh(&inventory);
+        for timestamp_ns in [8_000_000, 15_000_000] {
+            assert!(
+                matches!(
+                    ext.resolve_packet(
+                        &PacketEvent {
+                            timestamp_ns,
+                            ..packet
+                        },
+                        &inventory,
+                        true
+                    ),
+                    PacketResult::Unknown
+                ),
+                "shared current descriptors veto both observed and direct-call evidence"
+            );
+        }
+    }
 }

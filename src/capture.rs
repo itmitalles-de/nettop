@@ -223,13 +223,19 @@ pub(super) struct Untracked {
 /// header fields that identify the datagram and its ports are retained.
 #[derive(Default)]
 struct Fragments {
-    ports: HashMap<FragmentKey, (Protocol, u16, u16, Instant)>,
+    ports: HashMap<(u32, Direction, FragmentKey), FragmentPorts>,
+}
+
+struct FragmentPorts {
+    ports: Option<(Protocol, u16, u16)>,
+    seen: Instant,
 }
 
 impl Fragments {
     fn apply(&mut self, packet: &mut Packet, now: Instant) {
         match packet.fragment {
             Some(Fragment::First(key)) => {
+                let key = (packet.flow.interface_index, packet.flow.direction, key);
                 let (Some(source), Some(destination)) =
                     (packet.flow.source_port, packet.flow.destination_port)
                 else {
@@ -239,13 +245,31 @@ impl Fragments {
                     self.expire(now);
                 }
                 if self.ports.len() < MAX_FRAGMENTED_DATAGRAMS || self.ports.contains_key(&key) {
+                    let ports = (packet.flow.protocol, source, destination);
                     self.ports
-                        .insert(key, (packet.flow.protocol, source, destination, now));
+                        .entry(key)
+                        .and_modify(|entry| {
+                            // Independent datagrams can reuse the same IP ID,
+                            // even on one link. Once their ports disagree, do
+                            // not choose either sender for later fragments.
+                            if now.saturating_duration_since(entry.seen) > FRAGMENT_LIFETIME {
+                                entry.ports = Some(ports);
+                            } else if entry.ports != Some(ports) {
+                                entry.ports = None;
+                            }
+                            entry.seen = now;
+                        })
+                        .or_insert(FragmentPorts {
+                            ports: Some(ports),
+                            seen: now,
+                        });
                 }
             }
             Some(Fragment::Later(key)) => {
-                if let Some(&(protocol, source, destination, seen)) = self.ports.get(&key)
-                    && now.saturating_duration_since(seen) <= FRAGMENT_LIFETIME
+                let key = (packet.flow.interface_index, packet.flow.direction, key);
+                if let Some(entry) = self.ports.get(&key)
+                    && now.saturating_duration_since(entry.seen) <= FRAGMENT_LIFETIME
+                    && let Some((protocol, source, destination)) = entry.ports
                 {
                     packet.flow.protocol = protocol;
                     packet.flow.source_port = Some(source);
@@ -258,7 +282,7 @@ impl Fragments {
 
     fn expire(&mut self, now: Instant) {
         self.ports
-            .retain(|_, entry| now.saturating_duration_since(entry.3) <= FRAGMENT_LIFETIME);
+            .retain(|_, entry| now.saturating_duration_since(entry.seen) <= FRAGMENT_LIFETIME);
     }
 }
 
@@ -748,5 +772,95 @@ mod tests {
             );
         }
         assert_eq!(fragments.ports.len(), MAX_FRAGMENTED_DATAGRAMS);
+    }
+    #[test]
+    fn fragments_are_scoped_to_their_capture_link_and_direction() {
+        let key = FragmentKey {
+            source: "192.0.2.1".parse().unwrap(),
+            destination: "198.51.100.2".parse().unwrap(),
+            id: 42,
+            protocol: 17,
+        };
+        let packet = |index, direction, ports: Option<(u16, u16)>, fragment| Packet {
+            flow: Flow {
+                source: key.source,
+                destination: key.destination,
+                source_port: ports.map(|p| p.0),
+                destination_port: ports.map(|p| p.1),
+                protocol: Protocol::Udp,
+                interface_index: index,
+                direction,
+            },
+            bytes: 1500,
+            fragment: Some(fragment),
+        };
+        let mut fragments = Fragments::default();
+        let now = Instant::now();
+        for (index, direction, ports) in [
+            (10, Direction::Outgoing, (40000, 53)),
+            (20, Direction::Outgoing, (50000, 54)),
+            (10, Direction::Incoming, (60000, 55)),
+        ] {
+            fragments.apply(
+                &mut packet(index, direction, Some(ports), Fragment::First(key)),
+                now,
+            );
+        }
+        for (index, direction, ports) in [
+            (10, Direction::Outgoing, (40000, 53)),
+            (20, Direction::Outgoing, (50000, 54)),
+            (10, Direction::Incoming, (60000, 55)),
+        ] {
+            let mut later = packet(index, direction, None, Fragment::Later(key));
+            fragments.apply(&mut later, now);
+            assert_eq!(
+                (later.flow.source_port, later.flow.destination_port),
+                (Some(ports.0), Some(ports.1))
+            );
+        }
+        let mut unseen = packet(30, Direction::Outgoing, None, Fragment::Later(key));
+        fragments.apply(&mut unseen, now);
+        assert_eq!(unseen.flow.source_port, None);
+        // Contradictory IDs on one capture path are not enough to pick a port.
+        fragments.apply(
+            &mut packet(
+                10,
+                Direction::Outgoing,
+                Some((41000, 53)),
+                Fragment::First(key),
+            ),
+            now,
+        );
+        fragments.apply(
+            &mut packet(
+                10,
+                Direction::Outgoing,
+                Some((40000, 53)),
+                Fragment::First(key),
+            ),
+            now,
+        );
+        let mut ambiguous = packet(10, Direction::Outgoing, None, Fragment::Later(key));
+        fragments.apply(&mut ambiguous, now);
+        assert_eq!(
+            (ambiguous.flow.source_port, ambiguous.flow.destination_port),
+            (None, None)
+        );
+        // The unrelated interface remains usable, and ambiguity expires.
+        let mut unaffected = packet(20, Direction::Outgoing, None, Fragment::Later(key));
+        fragments.apply(&mut unaffected, now);
+        assert_eq!(unaffected.flow.source_port, Some(50000));
+        let later_now = now + FRAGMENT_LIFETIME + Duration::from_millis(1);
+        fragments.apply(
+            &mut packet(
+                10,
+                Direction::Outgoing,
+                Some((41000, 53)),
+                Fragment::First(key),
+            ),
+            later_now,
+        );
+        fragments.apply(&mut ambiguous, later_now);
+        assert_eq!(ambiguous.flow.source_port, Some(41000));
     }
 }

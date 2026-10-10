@@ -9,6 +9,7 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import select
 import signal
 import socket
 import statistics
@@ -30,7 +31,7 @@ def exact(connection, size):
     return bytes(data)
 
 
-def receiver(family, kind, count, control, finished, exit_early):
+def receiver(family, kind, count, control, finished, exit_early, udp_receive_mode):
     address = "127.0.0.1" if family == socket.AF_INET else "::1"
     with socket.socket(family, kind) as listener:
         listener.settimeout(5)
@@ -52,9 +53,18 @@ def receiver(family, kind, count, control, finished, exit_early):
                     datagram.settimeout(5)
                     datagram.bind((address, 0))
                     control.send(datagram.getsockname()[1])
-                    data, peer = datagram.recvfrom(8192)
+                    if udp_receive_mode == "read":
+                        # Python's timeout socket uses a nonblocking fd. Wait
+                        # for readability before the real peerless read(2).
+                        assert select.select([datagram], [], [], 5)[0], "UDP read timed out"
+                        data = os.read(datagram.fileno(), 8192)
+                    elif udp_receive_mode == "recv":
+                        data = datagram.recv(8192)
+                    else:
+                        data, peer = datagram.recvfrom(8192)
                     assert data == PAYLOAD
-                    assert datagram.sendto(REPLY, peer) == len(REPLY)
+                    if udp_receive_mode == "recvfrom":
+                        assert datagram.sendto(REPLY, peer) == len(REPLY)
     control.send("finished")
     if not exit_early:
         finished.wait(15)
@@ -83,20 +93,23 @@ def wait_capture(monitor):
     raise AssertionError("capture startup did not finish")
 
 
-def run_case(binary, family, kind, exit_early=False):
+def run_case(binary, family, kind, exit_early=False, udp_receive_mode="recvfrom"):
+    peerless = udp_receive_mode != "recvfrom"
     label = ("IPv4" if family == socket.AF_INET else "IPv6") + " " + (
         "TCP" if kind == socket.SOCK_STREAM else "UDP"
-    ) + (" exited receiver" if exit_early else "")
+    ) + (" exited receiver" if exit_early else "") + (
+        f" receive-only {udp_receive_mode} All" if peerless else ""
+    )
     count = 60 if kind == socket.SOCK_STREAM else 200
     parent, child = mp.Pipe()
     finished = mp.Event()
-    server = mp.Process(target=receiver, args=(family, kind, count, child, finished, exit_early))
+    server = mp.Process(target=receiver, args=(family, kind, count, child, finished, exit_early, udp_receive_mode))
     monitor = None
     try:
         with tempfile.TemporaryDirectory(prefix="nwtop-extended-") as config:
             env = dict(os.environ, XDG_CONFIG_HOME=config)
             monitor = subprocess.Popen(
-                [str(binary), "--interface", "lo", "--json", "--interval", "5"],
+                [str(binary), "--interface", "all" if peerless else "lo", "--json", "--interval", "5"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
             )
             wait_capture(monitor)
@@ -123,8 +136,9 @@ def run_case(binary, family, kind, exit_early=False):
                     else:
                         # Exercise unconnected sendto and recvfrom metadata.
                         assert sender.sendto(PAYLOAD, (address, port)) == len(PAYLOAD)
-                        data, _ = sender.recvfrom(8192)
-                        assert data == REPLY
+                        if not peerless:
+                            data, _ = sender.recvfrom(8192)
+                            assert data == REPLY
                 durations.append(time.monotonic() - started)
             assert parent.poll(5) and parent.recv() == "finished", f"{label}: receiver failed"
             if exit_early:
@@ -140,10 +154,13 @@ def run_case(binary, family, kind, exit_early=False):
             rows = {r["pid"]: r for r in snapshot["processes"]}
             expected = {
                 (os.getpid(), "tx_bytes"): count * len(PAYLOAD),
-                (os.getpid(), "rx_bytes"): count * len(REPLY),
                 (server.pid, "rx_bytes"): count * len(PAYLOAD),
-                (server.pid, "tx_bytes"): count * len(REPLY),
             }
+            if not peerless:
+                expected.update({
+                    (os.getpid(), "rx_bytes"): count * len(REPLY),
+                    (server.pid, "tx_bytes"): count * len(REPLY),
+                })
             measured = {f"{pid}:{field}": rows.get(pid, {}).get(field, 0)
                         for pid, field in expected}
             print(json.dumps({"case": label, "connections": count,
@@ -153,6 +170,17 @@ def run_case(binary, family, kind, exit_early=False):
                               "unattributed": rows.get(None, {}), "capture": capture}), flush=True)
             assert capture["active"] and capture["dropped"] == 0, f"{label}: {capture}"
             assert any(n.get("code") == "extended" for n in notes), f"{label}: {capture}"
+            if peerless:
+                assert any(n.get("code") == "all_socket_packets" for n in notes), capture
+                assert not issues, f"{label}: {issues}"
+                # No reply/sendto can supply a known-peer server event and
+                # mask missing read/recv actors. Both directions count IP bytes
+                # exactly; each UDP datagram has one ordinary IP+UDP header.
+                ip_header = 20 if family == socket.AF_INET else 40
+                ip_bytes = count * (len(PAYLOAD) + ip_header + 8)
+                assert rows.get(server.pid, {}).get("rx_bytes", 0) == ip_bytes, rows
+                assert rows.get(server.pid, {}).get("tx_bytes", 0) == 0, rows
+                assert rows.get(os.getpid(), {}).get("tx_bytes", 0) == ip_bytes, rows
             # Closed TCP sockets can leave control packets outside the proven
             # ownership window. An untracked loopback flow must report that
             # limitation; accept only this precise notice and a bounded tail.
@@ -268,13 +296,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--isolated-vm", action="store_true", required=True)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--case", choices=["all", "tcp4", "tcp6", "udp4", "udp6", "exited", "burst"], default="all")
+    parser.add_argument("--case", choices=["all", "tcp4", "tcp6", "udp4", "udp6", "exited", "burst", "peerless"], default="all")
     args = parser.parse_args()
-    assert os.geteuid() == 0, "run as root only inside the dedicated test VM"
+    if os.geteuid() != 0:
+        raise SystemExit("run as root only inside the dedicated test VM")
     virtualization = subprocess.run(["systemd-detect-virt", "--vm"], capture_output=True, text=True)
-    assert virtualization.returncode == 0 and virtualization.stdout.strip() in {"qemu", "kvm"}, (
-        "refusing kernel tracing outside an explicitly isolated QEMU/KVM VM"
-    )
+    if virtualization.returncode != 0 or virtualization.stdout.strip() not in {"qemu", "kvm"}:
+        raise SystemExit("refusing kernel tracing outside an explicitly isolated QEMU/KVM VM")
     binary = args.binary.resolve(strict=True)
     for name, family, kind in [
         ("tcp4", socket.AF_INET, socket.SOCK_STREAM),
@@ -288,6 +316,10 @@ def main():
         run_case(binary, socket.AF_INET, socket.SOCK_DGRAM, exit_early=True)
     if args.case in {"all", "burst"}:
         run_burst(binary)
+    if args.case in {"all", "peerless"}:
+        for family in [socket.AF_INET, socket.AF_INET6]:
+            for receive_mode in ["read", "recv"]:
+                run_case(binary, family, socket.SOCK_DGRAM, udp_receive_mode=receive_mode)
     print("PASS optional socket attribution", flush=True)
 
 

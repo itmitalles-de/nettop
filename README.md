@@ -161,6 +161,9 @@ supplies positive evidence even without conntrack, including queued receives on
 long-lived NOTRACK sockets. Current descriptor evidence and ambiguity checks
 still apply. A uniquely observed reader may receive credit after a descriptor
 transfer; this does not claim historical ownership when the packet arrived.
+Receive-only unconnected UDP sockets using `read()` or `recv()` are supported:
+their socket identity and syscall window supply actor evidence even when the
+syscall exposes no peer address. They do not create an incomplete tuple match.
 Connection rows use the endpoints actually present in the captured packet;
 packets without complete transport ports contribute only to process totals.
 

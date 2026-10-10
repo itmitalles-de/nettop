@@ -76,8 +76,10 @@ unreadable packets, so a past burst does not taint later snapshots.
 
 `packet.rs` handles IP/TCP/UDP headers, link formats, VLANs, IPv6 extensions and
 fragments, including zero-length IPv4 BIG TCP/GSO frames. The capture worker
-keeps a bounded two-second cache of first-fragment ports so later fragments of
-the same datagram are attributed. Process rates count observed IP bytes; interface totals also include
+keeps a bounded two-second cache of first-fragment ports, scoped by capture
+interface and direction. Conflicting ports quarantine that fragment identity
+until expiry rather than selecting one datagram. Process rates count observed
+IP bytes; interface totals also include
 other protocols and link overhead. All-interface mode can observe the same
 traffic at several virtual links and warns accordingly.
 
